@@ -1,6 +1,6 @@
 # Engineering Specification: Vocoder-Resilient Acoustic Data Modem (V-RADM)
 
-**Document Version:** 3.6.0
+**Document Version:** 3.6.1
 
 **Status:** Closed Baseline Engineering Specification
 
@@ -8,25 +8,28 @@
 
 ---
 
-## 1. System Architecture & Operating Principles
+## 1. System Architecture & Process Boundaries
 
-V-RADM establishes a point-to-point IPv4 tunnel across speech-compressed cellular voice channels (VoLTE, VoNR, 3G AMR, carrier VoIP) and acoustic air gaps. It enables unmodified network applications—specifically **OpenSSH** and **Mosh (Mobile Shell)**—to function reliably under extreme bandwidth, latency, and transcoding constraints.
+V-RADM establishes a point-to-point IPv4 tunnel across speech-compressed cellular voice channels (VoLTE, VoNR, 3G AMR, carrier VoIP) and acoustic air gaps. It exposes a standard system network interface on both endpoints, enabling unmodified network applications—such as third-party terminal clients (**Blink Shell**, **Termius**, **Prompt**), **OpenSSH**, and **Mosh (Mobile Shell)**—to operate reliably over the link.
 
 ```
  ┌────────────────────────────────────────────────────────────────────────┐
  │                              iOS HOST                                  │
  │                                                                        │
+ │  [Third-Party Applications] (Blink Shell, Termius, curl, etc.)         │
+ │                            │ Native IP Traffic (Destination: 10.99.0.1)│
+ │                            ▼                                           │
  │  ┌──────────────────────────────────────────────────────────────────┐  │
- │  │ NetworkExtension Process (PacketTunnelProvider)                  │  │
- │  │  - Intercepts IP packets from OS via virtual utun interface      │  │
- │  │  - MTU: 256 bytes | Subnet: 10.99.0.2/24                         │  │
+ │  │ NetworkExtension Sandbox Process (PacketTunnelProvider)          │  │
+ │  │  - Configures split-tunnel utun interface (10.99.0.0/24, MTU 256)│  │
+ │  │  - Ingests/injects IP packets via packetFlow                     │  │
  │  └──────────────────────────────┬───────────────────────────────────┘  │
  │                                 │ Lock-Free IPC Ring Buffer            │
  │                                 │ (App Group Shared POSIX Memory)      │
  │                                 ▼                                      │
  │  ┌──────────────────────────────────────────────────────────────────┐  │
  │  │ Main App Process (Foreground / Background Audio Entitlements)    │  │
- │  │  - User-Facing Terminal UI (Embedded LibSSH2 / LibMosh Core)     │  │
+ │  │  - Modem Controller & Telemetry Dashboard (Status, SNR, VU meters│  │
  │  │  - libvradm_core Engine (IP Slicer, ARQ, RS FEC, PHY Modulator)  │  │
  │  │  - Drift-Decoupling FIFO (Resolves 5.0ms IO vs 4.0ms slot timing)│  │
  │  │  - AVAudioEngine (Topology A: USB DAC / Topology C: In-Call API) │  │
@@ -142,7 +145,7 @@ To prevent empty feedback transmissions from burning 6.4 seconds of channel time
 
 * **Bytes 0x00..0x01:** `SYNC_WORD` (`0xD391`).
 * **Byte 0x02:** `CCF_CTRL` (Bit [7]: `1` = CCF Marker; Bits [6..4]: Target/Requested MCS; Bit [3]: TDD Yield Flag; Bits [2..0]: Command Type: `001` = Standalone ACK, `010` = MCS Commit Ack, `011` = TDD Grant).
-* **Bytes 0x03:** `ACK_BASE` (Cumulative ACK sequence number).
+* **Byte 0x03:** `ACK_BASE` (Cumulative ACK sequence number).
 * **Byte 0x04:** `ACK_MAP` (7-bit selective ACK bitmap).
 * **Bytes 0x05..0x06:** CRC-16-CCITT covering bytes `0x02..0x04`.
 * **Byte 0x07:** `RESERVED` (Fixed to `0x00`).
@@ -155,8 +158,6 @@ To prevent empty feedback transmissions from burning 6.4 seconds of channel time
 
 ### 3.1 Formal Throughput Hierarchy
 
-To prevent ambiguity between theoretical capacities and operational network delivery, three distinct rate tiers are formally defined:
-
 1. **Raw PHY Rate ($R_{\text{PHY}}$):** Total raw bit rate emitted by the modulator:
 
 $$R_{\text{PHY}} = \text{Baud} \times \log_2(Y) = \text{Baud} \times X$$
@@ -167,7 +168,7 @@ $$R_{\text{PHY}} = \text{Baud} \times \log_2(Y) = \text{Baud} \times X$$
 $$R_{\text{L3}} = \frac{296\text{ bits}}{T_{\text{frame}}}$$
 
 
-3. **Application Goodput ($R_{\text{APP}}$):** Realizable end-to-end user data throughput through standard IP sockets. It incorporates PLCP cadence, transport headers, and link-layer ARQ airtime efficiency:
+3. **Application Goodput ($R_{\text{APP}}$):** Realizable end-to-end user data throughput through standard IP sockets, incorporating PLCP cadence, transport headers (MTU 256), and link-layer ARQ airtime efficiency:
 
 $$R_{\text{APP}} = R_{\text{PHY}} \cdot \eta_{\text{FEC}} \cdot \eta_{\text{PLCP}} \cdot \eta_{\text{ARQ}} \cdot \eta_{\text{IP}} \cdot \eta_{\text{Transport}}$$
 
@@ -198,11 +199,11 @@ To suppress wideband clicks at symbol transitions without breaking sample alignm
 
 * At $F_s = 8,000\text{ Hz}$: Transition length $L = 4\text{ samples}$.
 * At $F_s = 16,000\text{ Hz}$: Transition length $L = 8\text{ samples}$.
+
 For a symbol of duration $N_{\text{sym}}$ samples, the smoothing envelope $w(n)$ is defined as:
 
+
 $$w(n) = \begin{cases}  \frac{1}{2}\left[1 - \cos\left(\frac{\pi (n + 0.5)}{L}\right)\right] & 0 \le n < L \\  1.0 & L \le n < N_{\text{sym}} - L \\  \frac{1}{2}\left[1 - \cos\left(\frac{\pi (N_{\text{sym}} - 1 - n + 0.5)}{L}\right)\right] & N_{\text{sym}} - L \le n < N_{\text{sym}}  \end{cases}$$
-
-
 
 #### MCS 0: Free-Air Acoustic TDD (Feature-Domain)
 
@@ -299,8 +300,6 @@ $$k \in \{2, 3, 5, 6, 7, 8, 9, 10\} \implies f_k \in \{571.4, 857.1, 1428.6, 171
 * **Demodulation:** Differential QPSK across consecutive OFDM symbol slots eliminates the requirement for absolute carrier-phase channel estimation under the assumption of sufficiently slow channel variation.
 
 ### 3.3 Transmit Signal Conditioning & Peak Limiting
-
-To ensure consistent acoustic output levels across all modulation modes without digital clipping:
 
 1. **Target RMS Normalization:** Every synthesized block of audio $s[n]$ of length $N$ is scaled to a target RMS level of $V_{\text{target\_rms}} = 0.3535\text{ FS}$ ($-9.03\text{ dBFS}$ RMS):
 
@@ -402,8 +401,6 @@ In open-air acoustic conditions, simultaneous bidirectional audio triggers phone
 ```
 
 ### 5.1 Deterministic TDD Ownership State Machine
-
-To prevent acoustic collision lockouts:
 
 1. **Token Ownership:** Initial channel ownership is assigned to the calling gateway (Asterisk PBX / Master node).
 2. **Transmission Eligibility:** A node may transmit if and only if it holds the Channel Token.
@@ -539,7 +536,24 @@ To eliminate packet ID wrap ambiguities over sliding ARQ windows, datagram ident
 
 * **Virtual MTU:** Standardized at **256 bytes** ($\lceil 256 / 37 \rceil = 7\text{ frames}$ per packet).
 
-### 7.2 OpenSSH Client Configuration (`~/.ssh/config`)
+### 7.2 Strict Split-Tunnel Routing Configuration
+
+The iOS Network Extension (`PacketTunnelProvider`) configures an `NEPacketTunnelNetworkSettings` profile enforcing a strict split-tunnel. Only destination traffic destined for the modem gateway subnet (`10.99.0.0/24`) is routed through the virtual adapter:
+
+```swift
+let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "10.99.0.1")
+let ipv4Settings = NEIPv4Settings(addresses: ["10.99.0.2"], subnetMasks: ["255.255.255.0"])
+
+// Strictly route ONLY the modem subnet:
+ipv4Settings.includedRoutes = [NEIPv4Route(destinationAddress: "10.99.0.0", subnetMask: "255.255.255.0")]
+// Default route (0.0.0.0/0) MUST NOT be set to avoid saturating sub-2kbps link
+
+settings.ipv4Settings = ipv4Settings
+settings.mtu = 256
+
+```
+
+### 7.3 OpenSSH Client Configuration (`~/.ssh/config`)
 
 ```text
 Host vradm-gw
@@ -565,7 +579,7 @@ Host vradm-gw
 
 ```
 
-### 7.3 Canonical Mosh Invocation
+### 7.4 Canonical Mosh Invocation
 
 Mosh provides predictive local echo, eliminating typing latency over slow acoustic links:
 
@@ -633,11 +647,18 @@ SOTP handles unidirectional, broadcast data drops. SOTP frames occupy the 38-byt
 
 ```
 
-### 9.1 iOS Implementation Realities
+### 9.1 iOS Implementation Architecture
 
 * **Process Separation:** `NEPacketTunnelProvider` runs inside a sandboxed Network Extension process, while `AVAudioEngine` runs in the main app process.
 * **IPC Bridge:** A lock-free shared memory ring buffer (`mmap` over an App Group container file) links the extension and main app with an acceptance target of $p99 \le 2.0\text{ ms}$ IPC latency.
-* **Application Shell:** The terminal UI is embedded inside the main iOS app via `LibMosh` or `LibSSH2`, consuming the virtual tunnel. Child CLI processes are not spawned in the sandbox.
+* **Controller & Dashboard UI:** The main iOS app does not host an embedded terminal UI or custom terminal emulation libraries. It functions exclusively as a **Modem Controller & Telemetry Dashboard**, providing:
+* VPN lifecycle management (`NETunnelProviderManager`).
+* Live link metrics (active TX/RX MCS, estimated SNR, DPLL carrier sync lock).
+* Decoder health indicators (FER, RS bytes/erasures corrected, ARQ queue depth).
+* Audio I/O calibration (input/output VU meters and manual TX digital back-off controls).
+
+
+* **Third-Party Terminal Operation:** Third-party terminal apps (Blink Shell, Termius, Prompt) running on the device connect directly to `10.99.0.1` via standard system TCP/UDP sockets routed transparently through the `PacketTunnelProvider` virtual adapter.
 
 ### 9.2 Linux / Asterisk PBX AudioSocket Gateway
 
@@ -727,7 +748,7 @@ void   vradm_process_audio(vradm_engine_t* engine, const int16_t* in_samples, si
 size_t vradm_generate_audio(vradm_engine_t* engine, int16_t* out_samples, size_t max_count);
 
 /* --- Mode A: IP Packet Datagram Stream (TUN Interface) --- */
-int32_t vradm_write_ip_packet(vradm_engine_t* engine, const uint8_t* packet, size_t len);
+int32_t vradm_write_ip_packet(vradm_engine_t* engine, const uint8_t* packet, size_len);
 int32_t vradm_poll_ip_packet(vradm_engine_t* engine, uint8_t* out_packet, size_t max_len);
 
 /* --- Mode B: SOTP Simplex Object Transfer --- */
