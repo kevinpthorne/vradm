@@ -1,6 +1,6 @@
 # Engineering Specification: Vocoder-Resilient Acoustic Data Modem (V-RADM)
 
-**Document Version:** 3.8.2
+**Document Version:** 3.8.4
 
 **Status:** Closed Baseline Engineering Specification (Implementation-Ready Research Prototype)
 
@@ -149,7 +149,7 @@ V-RADM defines two physical layer frame formats: the **Canonical Data Frame (64 
 * **Byte 0x03:** `ACK_BASE` (Cumulative ACK sequence number).
 * **Byte 0x04:** `ACK_MAP` (7-bit selective ACK bitmap).
 * **Bytes 0x05..0x06:** CRC-16-CCITT covering bytes `0x02..0x04`.
-* **Byte 0x07:** `CCF_MAC` (Truncated 8-bit SipHash-2-4 MAC computed over `SESSION_EPOCH || CCF_CTRL || ACK_BASE || ACK_MAP || CCF_CRC16` using PSK, covering bytes `0x02..0x06` bound to the 32-bit session epoch; see §4.1). Frames failing MAC validation are dropped before state-machine ingestion (see §4.1 for Anti-DoS lockout policy and noise separation).
+* **Byte 0x07:** `CCF_MAC` (Truncated 8-bit SipHash-2-4 MAC computed over `SESSION_EPOCH || LE16(c_req) || CCF_CTRL || ACK_BASE || ACK_MAP || CCF_CRC16` using $K_{\text{CTRL\_MAC}}$, binding the control frame to the active session epoch and the full 16-bit monotonic control counter of the burst being acknowledged; see §4.0 and §4.1). Frames failing MAC validation are dropped before state-machine ingestion (see §4.1 for unauthenticated frame handling and noise separation).
 * **Bytes 0x08..0x0F:** Systematic $\text{RS}(16, 8)$ Galois field parity covering bytes `0x00..0x07` (8 parity bytes correcting up to $t = 4$ erroneous bytes).
 * **Total CCF Duration at MCS 0:** $\frac{128\text{ bits}}{4\text{ bits/sym}} \times 50.0\text{ ms} = \mathbf{1.6\text{ seconds}}$.
 
@@ -170,9 +170,9 @@ V-RADM defines two physical layer frame formats: the **Canonical Data Frame (64 
  │ 1    │ Feature  │ 50     │ 256       │ 3           │ 8        │ 400.0      │ 231.25   │ 225.04      │ ~155.0       │
  │ 2*   │ Hybrid   │ 100    │ 256       │ 4           │ 8        │ 800.0      │ 455.38   │ 431.92      │ ~330.0       │
  │ 3*   │ Coherent │ 200    │ 65,536    │ 8           │ 16       │ 3,200.0    │ 1,793.94 │ 1,477.69    │ ~920.0       │
- │ 4    │ Waveform │ 250    │ 65,536    │ 8           │ 16       │ 4,000.0    │ 2,242.42 │ 1,769.14    │ ~1,450       │
+ │ 4*   │ Waveform │ 250    │ 65,536    │ 8           │ 16       │ 4,000.0    │ 2,242.42 │ 1,769.14    │ ~1,450       │
  └──────┴──────────┴────────┴───────────┴─────────────┴──────────┴────────────┴──────────┴─────────────┴──────────────┘
- *Note: MCS 2 and MCS 3 are experimentally gated modes; operational enablement requires passing TC-04.
+ *Note: MCS 2, MCS 3, and MCS 4 are experimentally gated modes: operational enablement requires passing TC-04a (Balanced Cellular Gate for MCS 2), TC-04b (Wideband Cellular Gate for MCS 3), and TC-11 (G.711 VoIP Gate for MCS 4) respectively.
 ```
 
 * **Framing Structure (1 Differential Reference Symbol Per Frame):**
@@ -205,43 +205,61 @@ Where:
 
 $$\Delta \theta_{\text{dither}}(n) = \Delta \theta_{\text{raw}}[m-1] + (\Delta \theta_{\text{raw}}[m] - \Delta \theta_{\text{raw}}[m-1]) \cdot \frac{1}{2}\left[1 - \cos\left(\frac{\pi (n_{\text{edge}} + 0.5)}{L}\right)\right]$$
 
-  * This bounds out-of-band phase-modulation sidebands to $<-40\text{ dBc}$ while completely preventing cellular baseband stationary-whistle gating.
-  * The receiver executes an identical synchronized generator, subtracting $\Delta \theta_{\text{dither}}(n)$ prior to constellation slicing and timing recovery.
+  * This bounds out-of-band phase-modulation sidebands to $\le -40\text{ dBc}$ while empirically suppressing cellular baseband stationary-whistle gating across standard 3GPP VAD models (empirically verified in TC-05).
+  * On the receiver, the synchronized PRBS-7 generator serves as a known prior/reference signal rather than an assumed linear sample-level cancellation through the non-linear ACELP vocoder. In the carrier tracking domain, the expected 4th-power phase rotation $4 \Delta \theta_{\text{dither}}[m]$ is subtracted from $\angle q_k$ prior to inter-carrier timing slope estimation and demapping.
 
 #### Mid-Frame Continuous Sample-Slip Recovery: Multi-Carrier 4th-Power DLL (NDA)
 
 To prevent sample slips across asynchronous clock boundaries (`AVAudioEngine` vs. cellular baseband) from misaligning OFDM bins or DQPSK symbols between PLCP beacons without sacrificing data throughput:
 
-1. **PHY Baseband Signal Chain & 4th-Power Carrier Recovery:** Rather than sacrificing a dedicated subcarrier to an unmodulated pilot tone—which would degrade bit-loading—all subcarriers carry 2-bit DQPSK data throughout the payload ($Z=4$ for MCS 2, $Z=8$ for MCS 3). Carrier and sample-slip tracking relies on **4th-Power Non-Data-Aided (NDA)** processing:
-   * **Bandpass Filtering:** The received audio $x[n]$ is filtered around active subcarrier $k$:
-     $$z_k[n] = \operatorname{BPF}_k\{x[n]\}$$
-   * **Complex Baseband Downmixing:** The subcarrier is downmixed to complex baseband:
+* **Timing Recovery Architecture Scope by Active MCS:**
+  * **MCS 2 & MCS 3:** Primary symbol timing tracking is executed by the 4th-power inter-carrier phase-slope detector ($\hat{\tau} \propto -\partial\angle q_k/\partial f_k$) paired with complex baseband transition tracking on $u_k[n]$.
+  * **MCS 4:** Primary symbol timing tracking is executed by the Cyclic Prefix (CP) cross-correlator on every 4.0 ms slot ($0.5\text{ ms}$ CP correlation peak). Because CP-OFDM subcarriers are demodulated in baseband FFT bins, 4th-power phase-slope timing tracking is disabled during MCS 4 operation.
+
+1. **Analytic Signal Generation & 4th-Power Baseband Chain:** Rather than sacrificing a dedicated subcarrier to an unmodulated pilot tone—which would degrade bit-loading—all subcarriers carry 2-bit DQPSK data throughout the payload ($Z=4$ for MCS 2, $Z=8$ for MCS 3). Carrier and timing tracking relies on **4th-Power Non-Data-Aided (NDA)** processing:
+   * **Analytic Bandpass Pre-Filtering:** To prevent unrejected negative-frequency image distortion at $-2f_k$ upon complex downmixing, the received real PCM audio $x[n]$ is converted to an analytic signal centered at subcarrier $k$:
+     $$z_k[n] = \operatorname{BPF}^{\text{analytic}}_k\{x[n]\} = \operatorname{BPF}_k\{x[n]\} + j \cdot \mathcal{H}\{\operatorname{BPF}_k\{x[n]\}\}$$
+     where $\mathcal{H}\{\cdot\}$ is the Hilbert transform (yielding an analytic bandpass signal with $\ge 40\text{ dB}$ image rejection).
+   * **Complex Baseband Downmixing:** The analytic subcarrier is downmixed to complex baseband:
      $$u_k[n] = z_k[n] \cdot e^{-j \frac{2\pi f_k n}{F_s}}$$
-   * **4th-Power Non-Linearity:** The baseband signal is raised to the 4th power:
+   * **4th-Power Non-Linearity:** The complex baseband signal is raised to the 4th power:
      $$q_k[n] = (u_k[n])^4$$
    * **Phase-Error Interpretation:** For ideal 4-state phase modulation, the fourth-power operation removes the discrete QPSK phase state ($4 \cdot \Delta \phi_k \equiv 0 \pmod{2\pi}$); residual channel phase, frequency offset, noise, and dither remain. Thus, $q_k[n]$ is a **near-DC phase-error reference**, where sample-timing error manifests as a steady-state phase error proportional to subcarrier frequency $f_k$.
    * **DQPSK Ambiguity Synergy:** Stripping 4-phase modulation via 4th-power nonlinearity inherently produces a four-fold ($\pm 90^\circ, \pm 180^\circ$) phase ambiguity. V-RADM's deliberate selection of **Differential QPSK (DQPSK)** renders this ambiguity completely moot: data is encoded strictly in the phase transition between adjacent symbols ($\Delta \phi = \text{wrap}_{2\pi}(\phi(m) - \phi(m-1))$), guaranteeing that the four-fold quadrant ambiguity cancels out algebraically without requiring pilot tones or absolute phase reference tracking.
 
-2. **Multi-Carrier Diversity Combining (Squaring/Quartic Loss Mitigation):** Non-linear 4th-power processing incurs squaring/quartic loss, degrading effective SNR relative to a clean unmodulated tone. Because MCS 2 and MCS 3 are experimentally gated modes operating near the channel threshold ($M \to 0.60$), tracking off a single subcarrier would risk loss-of-lock under fading. To overcome squaring loss, the receiver coherently combines the 4th-power wiped residual across **all active subcarriers** ($Z=4$ in MCS 2, $Z=8$ in MCS 3), weighted by carrier amplitude $A_k$:
+2. **Inter-Carrier Phase-Slope Symbol Timing Detector:**
+   * A flat, constant-amplitude near-DC signal provides no energy transition for Early-Prompt-Late correlation. Instead, V-RADM extracts symbol timing directly from the **inter-carrier phase slope** across the subcarrier array.
+   * Because 4th-power wipes the data constellation, each subcarrier's 4th-power phase is related to subcarrier frequency $f_k$ and timing error $\tau$ by:
+     $$\angle q_k \approx \theta_0 - 8\pi f_k \tau + 4 \Delta \omega_c t$$
+   * The derivative of 4th-power phase with respect to subcarrier frequency is directly proportional to the timing error:
+     $$\frac{\partial \angle q_k}{\partial f_k} \approx -8\pi \tau$$
+   * The receiver unwraps $\angle q_k$ across all active subcarriers ($Z=4$ for MCS 2, $Z=8$ for MCS 3) and computes the linear regression slope to estimate fractional timing delay $\hat{\tau}$:
+     $$\hat{\tau} = -\frac{1}{8\pi} \frac{\sum_{k=0}^{Z-1} (f_k - \bar{f})(\angle q_k - \overline{\angle q})}{\sum_{k=0}^{Z-1} (f_k - \bar{f})^2}$$
+     where $\bar{f} = \frac{1}{Z}\sum f_k$ and $\overline{\angle q} = \frac{1}{Z}\sum \angle q_k$.
+   * This provides a continuous, highly sensitive symbol timing discriminator across all multicarrier modes without requiring dedicated pilot tones.
 
-$$\bar{q}[n] = \sum_{k} A_k \cdot q_k[n]$$
+3. **Phase-Aligned Coherent Carrier Combining (Maximum Ratio Combining):**
+   * Before summing across subcarriers for residual carrier frequency tracking, the timing-induced phase offset is removed from each carrier:
+     $$\tilde{q}_k[n] = q_k[n] \cdot e^{j 8\pi f_k \hat{\tau}}$$
+   * The phase-aligned residuals are combined using Maximum Ratio Combining (MRC) weights $w_k \propto \frac{|\mu_k|}{\sigma_k^2}$ based on measured post-4th-power SNR:
+     $$\bar{q}[n] = \sum_{k=0}^{Z-1} w_k \cdot \tilde{q}_k[n]$$
+   * Residual carrier frequency offset is tracked from the unwrapped phase rate: $\Delta f_0 = \frac{1}{8\pi} \frac{d}{dt} \text{unwrap}(\angle \bar{q}[n])$.
+   * *The theoretical coherent combining upper bound is $10 \log_{10}(Z)$ (+6.0 dB for MCS 2, +9.0 dB for MCS 3); actual measured combining gain under speech codec distortion is governed by TC-10b.*
 
-   *The theoretical coherent-combining upper bound is $10 \log_{10}(Z)$ (+6.0 dB for MCS 2, +9.0 dB for MCS 3); actual effective combining gain SHALL be measured and validated in TC-10.*
+4. **Mandatory 4th-Power Primary Loop (Anti-Cascade Protection):** The 4th-power NDA loop is mandated as the primary, unconditional timing-error detector. Sliced decision-directed (DD) modulation wiping is strictly prohibited as a coequal primary loop to prevent catastrophic **decision-directed loss-of-lock cascades** near the demotion threshold (where tentative symbol errors inject corrupt phase into the DLL, destabilizing timing and triggering burst demodulation collapse). DD tracking may only be enabled as an optional fine-tracking refinement in high-SNR regimes ($M \ge 0.85$).
 
-3. **Mandatory 4th-Power Primary Loop (Anti-Cascade Protection):** The 4th-power NDA loop is mandated as the primary, unconditional timing-error detector. Sliced decision-directed (DD) modulation wiping is strictly prohibited as a coequal primary loop to prevent catastrophic **decision-directed loss-of-lock cascades** near the demotion threshold (where tentative symbol errors inject corrupt phase into the DLL, destabilizing timing and triggering burst demodulation collapse). DD tracking may only be enabled as an optional fine-tracking refinement in high-SNR regimes ($M \ge 0.85$).
+5. **Symbol-Boundary Transient Exclusion Zone (Filter Settling & Window Derivation):** Phase transitions between adjacent DQPSK symbols are shaped by the raised-cosine edge window $w(n)$ ($L = 4\text{ samples at } 8\text{ kHz} = 0.5\text{ ms}$) and filtered through the receiver's linear-phase FIR subcarrier separation bandpass filters ($\operatorname{BPF}_k$). The total transient duration at each symbol boundary is the sum of the edge-shaping window $L$ and the filter group delay settling time $\tau_g$:
+   * **MCS 2 ($T_{\text{sym}} = 80\text{ samples}$, 100 Bd):** With 400 Hz carrier spacing, subcarrier separation uses an order-24 linear-phase FIR filter ($\tau_g = 12\text{ samples} = 1.5\text{ ms}$). Transients persist for $L + \tau_g = 4 + 12 = \mathbf{16\text{ samples}}$ ($2.0\text{ ms}$). To guarantee zero ISI and filter settling contamination in the timing recovery loop, the receiver excludes the initial 16 samples ($n \in [0, 15]$) and trailing 15 samples ($n \in [65, 79]$), constraining phase-slope evaluation to the interior steady-state quiescent window $n \in [16, 64]$ (49 quiescent samples).
+   * **MCS 3 ($T_{\text{sym}} = 40\text{ samples}$, 200 Bd):** With 200 Hz carrier spacing on 5 ms ACELP subframe boundaries, the optimized order-16 FIR filter has group delay $\tau_g = 8\text{ samples}$ ($1.0\text{ ms}$). Boundary transients persist for $L + \tau_g = 4 + 8 = \mathbf{12\text{ samples}}$ ($1.5\text{ ms}$). The receiver excludes samples $n \in [0, 11]$ and $n \in [29, 39]$, constraining phase-slope evaluation strictly to the central quiescent window $n \in [12, 28]$ (17 quiescent samples).
 
-4. **Symbol-Boundary Transient Exclusion Zone (Filter Settling & Window Derivation):** Phase transitions between adjacent DQPSK symbols are shaped by the raised-cosine edge window $w(n)$ ($L = 4\text{ samples at } 8\text{ kHz} = 0.5\text{ ms}$) and filtered through the receiver's linear-phase FIR subcarrier separation bandpass filters ($\operatorname{BPF}_k$). The total transient duration at each symbol boundary is the sum of the edge-shaping window $L$ and the filter group delay settling time $\tau_g$:
-   * **MCS 2 ($T_{\text{sym}} = 80\text{ samples}$, 100 Bd):** With 400 Hz carrier spacing, subcarrier separation uses an order-24 linear-phase FIR filter ($\tau_g = 12\text{ samples} = 1.5\text{ ms}$). Transients persist for $L + \tau_g = 4 + 12 = \mathbf{16\text{ samples}}$ ($2.0\text{ ms}$). To guarantee zero ISI and filter settling contamination in the timing recovery loop, the receiver excludes the initial 16 samples ($n \in [0, 15]$) and trailing 15 samples ($n \in [65, 79]$), constraining the 16-sample Early-Prompt-Late correlator to the interior steady-state quiescent window $n \in [16, 64]$ (49 quiescent samples).
-   * **MCS 3 ($T_{\text{sym}} = 40\text{ samples}$, 200 Bd):** With 200 Hz carrier spacing on 5 ms ACELP subframe boundaries, the optimized order-16 FIR filter has group delay $\tau_g = 8\text{ samples}$ ($1.0\text{ ms}$). Boundary transients persist for $L + \tau_g = 4 + 8 = \mathbf{12\text{ samples}}$ ($1.5\text{ ms}$). The receiver excludes samples $n \in [0, 11]$ and $n \in [29, 39]$, constraining correlator integration strictly to the central quiescent window $n \in [12, 28]$ (17 quiescent samples).
-
-5. **PLCP Bootstrap Handoff Tolerances:** The PLCP beacon trains coarse timing and frequency prior to payload handoff. To ensure the 4th-power payload tracking loop converges within its pull-in range, the PLCP receiver must deliver:
+6. **PLCP Bootstrap Handoff Tolerances:** The PLCP beacon trains coarse timing and frequency prior to payload handoff. To ensure the 4th-power payload tracking loop converges within its pull-in range, the PLCP receiver must deliver:
    * Maximum residual timing error at handoff: $|\Delta t_{\text{handoff}}| \le 2.0\text{ samples}$ ($0.25\text{ ms}$ at $8\text{ kHz}$, well within the Farrow interpolator's $\pm 8\text{ sample}$ pull-in range).
    * Maximum residual carrier frequency offset: $|\Delta f_{\text{handoff}}| \le \pm 12.5\text{ Hz}$ (well within the $\pm 25\text{ Hz}$ pull-in range of 100/200 Bd DQPSK).
    * The PLCP 2-FSK receiver must achieve $|\Delta t| \le 1.0\text{ sample}$ and $|\Delta f| \le \pm 5.0\text{ Hz}$ at $E_b/N_0 \ge 6.0\text{ dB}$.
 
-6. **Early-Prompt-Late Correlator & Sub-Sample Farrow Resampler:** Within the quiescent symbol window, the receiver calculates early ($n - 1$), prompt ($n$), and late ($n + 1$) correlation energy across the combined residual $\bar{q}[n]$ over a sliding 16-sample window. If late energy exceeds prompt energy by $\ge 4.5\text{ dB}$, a $+1$ sample slip is flagged; if early energy dominates, a $-1$ sample slip is flagged. The fractional Farrow filter dynamically shifts delay by $\pm 1$ sample within $2.5\text{ ms}$, preserving constellation tracking without dropping frames.
+7. **Sub-Sample Farrow Resampler & Loop Filter:** The estimated timing error $\hat{\tau}$ is filtered through a 2nd-order proportional-integral (PI) loop filter driving a cubic Farrow interpolator. The resampler dynamically shifts sampling delay by $\pm 1$ sample within $\le 2.5\text{ ms}$, preserving constellation tracking without dropping frames. Across symbol boundaries ($L = 4$ edge window), baseband transition tracking (Gardner TED operating at 2 samples per symbol) provides secondary clock verification.
 
-7. **MCS 4 CP Correlator:** Cyclic prefix cross-correlation evaluates timing drift on every 4.0 ms slot, eliminating cumulative timing error.
+8. **MCS 4 CP Correlator:** Cyclic prefix cross-correlation evaluates timing drift on every 4.0 ms slot, eliminating cumulative timing error.
 
 #### Raised-Cosine Edge Smoothing Window ($w(n)$)
 
@@ -276,6 +294,9 @@ $$\omega_0 = \frac{2\pi F_c}{F_s}, \quad \alpha = \frac{\sin(\omega_0)}{2Q}$$
 
 $$b_0 = \alpha, \quad b_1 = 0, \quad b_2 = -\alpha, \quad a_0 = 1 + \alpha, \quad a_1 = -2\cos(\omega_0), \quad a_2 = 1 - \alpha$$
 
+* **Coefficient Normalization ($a_0 = 1.0$):** Implementation filters normalize all transfer function coefficients by $a_0$:
+  $$\tilde{b}_0 = \frac{b_0}{a_0}, \quad \tilde{b}_1 = \frac{b_1}{a_0} = 0, \quad \tilde{b}_2 = \frac{b_2}{a_0}, \quad \tilde{a}_1 = \frac{a_1}{a_0}, \quad \tilde{a}_2 = \frac{a_2}{a_0}, \quad \tilde{a}_0 = 1.0$$
+* **Filter State Continuity:** In Direct-Form II realizations, internal delay states ($w[n-1], w[n-2]$) are maintained continuously across consecutive symbols within the same frame to preserve vocal tract phase coherence across speech atom transitions. States are reset to zero at frame boundaries.
 * **Synthesis:** $s(n) = w(n) \cdot [e(n) * h_{\text{vowel}}(n)]$.
 
 #### MCS 2: Balanced Cellular (Experimentally Gated Hybrid)
@@ -318,7 +339,12 @@ $$X[k] = D_k, \quad X[28 - k] = D_k^*, \quad X[0] = X[14] = 0$$
 
 $$x(n) = \frac{1}{\sqrt{N_{\text{fft}}}} \sum_{k=0}^{N_{\text{fft}}-1} X[k] e^{j \frac{2\pi k n}{N_{\text{fft}}}} \in \mathbb{R}$$
 
-* **Framing & Reference Slot:** Each frame comprises 33 OFDM slots ($132.0\text{ ms}$): Slot 0 ($m=0$) is a known differential reference slot ($D_k(0) = 1 + j$); Slots $m = 1 \dots 32$ carry the 512 bits (64 bytes) of protected payload and FEC.
+* **Sample-Exact Cyclic Prefix Prepending:**
+  For each 28-point real IFFT output $x[0 \dots 27]$, the 32-sample transmitted slot is constructed by prepending the final $N_{\text{cp}} = 4$ samples:
+  $$x_{\text{slot}}[n] = \begin{cases} x[24 + n], & 0 \le n < 4 \\ x[n - 4], & 4 \le n < 32 \end{cases}$$
+  yielding $x_{\text{slot}} = [x[24], x[25], x[26], x[27], x[0], x[1], \dots, x[27]]$.
+* **Framing & Reference Slot Construction:**
+  Each frame comprises 33 OFDM slots ($132.0\text{ ms}$): Slot 0 ($m=0$) is a known differential reference slot ($D_k(0) = 1 + j$); Slots $m = 1 \dots 32$ carry the 512 bits (64 bytes) of protected payload and FEC. The reference slot undergoes identical 28-point IFFT modulation, cyclic prefix prepending, and peak-safe normalization as data slots $m = 1 \dots 32$.
 * **Telephone-Band Carrier Allocation ($Z = 8$ Active Carriers):**
 
 $$k \in \{2, 3, 5, 6, 7, 8, 9, 10\} \implies f_k \in \{571.4, 857.1, 1428.6, 1714.3, 2000.0, 2285.7, 2571.4, 2857.1\}\text{ Hz}$$
@@ -339,19 +365,21 @@ Multi-carrier waveforms exhibit crest factors (Peak-to-Average Power Ratio) that
 | **MCS 3** | 8-carrier DQPSK | ~11.52 dB | 0.1334 FS | -17.50 dBFS | $\le 0.50\text{ FS}$ | 3.01 dB |
 | **MCS 4** | 8-carrier CP-OFDM | ~10.0 dB | 0.1585 FS | -16.00 dBFS | $\le 0.50\text{ FS}$ | 3.01 dB |
 
-2. **Peak-Constrained Normalization:** The scaling factor $g$ is constrained by both the mode target RMS and the maximum peak amplitude:
+2. **Peak-Constrained Normalization:** The linear scaling factor $g$ is constrained by both the mode target RMS and the linear peak headroom target ($V_{\text{target\_peak}} = 0.45\text{ FS}$ / $-6.93\text{ dBFS Peak}$):
 
-$$g = \min\left( \frac{V_{\text{target\_rms}}(\text{MCS})}{\sqrt{\frac{1}{N}\sum_{m=0}^{N-1} s^2[m]}}, \; \frac{V_{\text{peak\_max}}}{\max_{0 \le m < N} |s[m]|} \right), \quad \text{where } V_{\text{peak\_max}} = 0.50\text{ FS}$$
+$$g = \min\left( \frac{V_{\text{target\_rms}}(\text{MCS})}{\sqrt{\frac{1}{N}\sum_{m=0}^{N-1} s_{\text{raw}}^2[m]}}, \; \frac{V_{\text{target\_peak}}}{\max_{0 \le m < N} |s_{\text{raw}}[m]|} \right), \quad \text{where } V_{\text{target\_peak}} = 0.45\text{ FS}$$
 
-$$s[n] \leftarrow s[n] \cdot g$$
+$$s[n] \leftarrow s_{\text{raw}}[n] \cdot g$$
 
-3. **Hyperbolic Soft-Saturation Safety Limiter:** To eliminate the severe high-order harmonic distortion spurs generated by rectangular hard clippers, any residual exceptional peak transients are conditioned through a hyperbolic tangent soft limiter:
+3. **Hyperbolic Soft-Saturation Safety Limiter:** To eliminate the severe high-order harmonic distortion spurs generated by rectangular hard clippers, any residual exceptional peak transients exceeding $V_{\text{target\_peak}}$ are conditioned through a hyperbolic tangent soft limiter anchored at hard safety ceiling $V_{\text{peak\_max}} = 0.50\text{ FS}$ ($-6.02\text{ dBFS Peak}$):
 
-$$s[n] \leftarrow V_{\text{peak\_max}} \cdot \tanh\left(\frac{s[n]}{V_{\text{peak\_max}}}\right)$$
+$$s_{\text{out}}[n] \leftarrow V_{\text{peak\_max}} \cdot \tanh\left(\frac{s[n]}{V_{\text{peak\_max}}}\right), \quad \text{where } V_{\text{peak\_max}} = 0.50\text{ FS}$$
 
-This ensures that output samples are strictly bounded within $[-0.5\text{ FS}, +0.5\text{ FS}]$ ($-6.02\text{ dBFS Peak}$), providing $3.01\text{ dB}$ of analog DAC headroom without clipping multicarrier symbols.
+This ensures that output samples are strictly bounded within $[-0.5\text{ FS}, +0.5\text{ FS}]$ ($-6.02\text{ dBFS Peak}$), providing $3.01\text{ dB}$ of analog DAC headroom without hard clipping multicarrier symbols.
 
-* **Intermodulation Distortion (IMD) & Limiter Backstop Scoping:** Hyperbolic tangent soft saturation is inherently non-linear. When applied to composite multicarrier waveforms (MCS 2, 3, 4), any limiter activation generates intermodulation distortion (IMD) products that fall directly on or near active subcarriers, degrading Error Vector Magnitude (EVM). Therefore, the linear gain scaling stage ($g = \min(g_{\text{target}}, \frac{0.45}{\max |s_{\text{raw}}[n]|})$) is sized with sufficient crest-factor margin such that the $\tanh$ limiter acts strictly as an anomalous transient safety backstop. Under normal modulation, limiter saturation events SHALL occur on $< 0.05\%$ of samples, bounding IMD-induced EVM degradation to $\le 0.5\text{ dB}$ (empirically verified in TC-10).
+* **Intermodulation Distortion (IMD), Limiter Backstop Scoping & Saturation Metric:** Hyperbolic tangent soft saturation is inherently non-linear. When applied to composite multicarrier waveforms (MCS 2, 3, 4), any limiter activation generates intermodulation distortion (IMD) products that fall directly on or near active subcarriers, degrading Error Vector Magnitude (EVM).
+  * **Limiter Saturation Operational Definition:** An audio sample $n$ is formally defined as a **limiter saturation event** if and only if pre-saturation $|s[n]| > V_{\text{target\_peak}} = 0.45\text{ FS}$ (entering the non-linear compression regime of the $\tanh$ curve).
+  * **Acceptance Criterion:** Because the linear gain scaling stage ($g \le \frac{0.45}{\max |s_{\text{raw}}|}$) is sized with crest-factor margin, the $\tanh$ limiter acts strictly as an anomalous transient safety backstop. Under normal modulation, limiter saturation events SHALL occur on $< 0.05\%$ of samples, bounding IMD-induced EVM degradation to $\le 0.5\text{ dB}$ (empirically verified in TC-10c).
 
 ---
 
@@ -370,13 +398,84 @@ The receiver never inspects data frames to determine modulation parameters. Ever
 
 ```
 
+### 4.0 Session Epoch Bootstrap Handshake & Re-Keying Lifecycle
+
+Prior to transmitting user data or adapting modulation rates, endpoints establish cryptographic session state via a deterministic, two-way bootstrap handshake over the physical layer:
+
+```
+ Initiator (Node A)                                    Responder (Node B)
+ ┌─────────────────┐                                   ┌─────────────────┐
+ │ Generates R_A   │                                   │                 │
+ └────────┬────────┘                                   └────────┬────────┘
+          │                                                     │
+          │ 1. SESSION_REQUEST (32-Byte Frame: R_A + MAC)       │
+          ├────────────────────────────────────────────────────►│
+          │                                            ┌────────┴────────┐
+          │                                            │ Generates R_B   │
+          │                                            │ Computes EPOCH  │
+          │                                            └────────┬────────┘
+          │ 2. SESSION_ACCEPT (32-Byte Frame: R_B + MAC)        │
+          │◄────────────────────────────────────────────────────┤
+ ┌────────┴────────┐                                            │
+ │ Computes EPOCH  │                                            │
+ │ Ready (State=0) │                                            │
+ └─────────────────┘                                            │
+```
+
+1. **Exact 32-Byte Bootstrap Frame Layout:**
+   ```
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   MSG_TYPE    |             NONCE (R_A / R_B, 16 Bytes)       |
+   +-+-+-+-+-+-+-+-+                                               +
+   |                                                               |
+   |                                                               |
+   |                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                               |          EPOCH_HINT           |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |          EPOCH_HINT           |   BOOTSTRAP_MAC (8 Bytes)     |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+   |                                                               |
+   |                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                               |  BOOTSTRAP_CRC16  | RESERVED  |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   ```
+   * **Byte 0x00:** `MSG_TYPE` (`0xBE` = `SESSION_REQUEST`, `0xBF` = `SESSION_ACCEPT`).
+   * **Bytes 0x01..0x10:** `NONCE` (128-bit CSPRNG nonce $R_A$ or $R_B$).
+   * **Bytes 0x11..0x14:** `EPOCH_HINT` (`0x00000000` in request; computed `SESSION_EPOCH` in accept).
+   * **Bytes 0x15..0x1C:** `BOOTSTRAP_MAC` (64-bit truncated SipHash-2-4 computed over bytes `0x00..0x14` using PSK).
+   * **Bytes 0x1D..0x1E:** `BOOTSTRAP_CRC16` (CRC-16-CCITT covering bytes `0x00..0x1C`).
+   * **Byte 0x1F:** `RESERVED` (`0x00`).
+   * **Modulation & Timing:** Modulated via robust MCS 0 (or 2-FSK at 100 Bd). Handshake retransmission timeout $T_{\text{boot\_rto}} = 1.5\text{ seconds}$ with binary exponential backoff ($1.5\text{ s}, 3.0\text{ s}, 6.0\text{ s}$; up to 3 retries).
+2. **Simultaneous Initiation Tie-Breaking:**
+   * If both endpoints transmit `SESSION_REQUEST` concurrently, each node compares $\text{uint128}(R_A)$ with $\text{uint128}(R_{\text{received}})$.
+   * The node presenting the numerically greater nonce ($\text{uint128}(R) > \text{uint128}(R_{\text{peer}})$) is designated the Initiator.
+   * The node with the smaller nonce immediately yields, drops its pending request, treats the incoming request as valid, and responds with `SESSION_ACCEPT`.
+3. **Session Epoch & Control Key Derivation (BLAKE3 KDF):**
+   * Rather than invoking keyed hashing with a 16-byte key (which is invalid because BLAKE3 keyed mode requires exactly 32 bytes), endpoints utilize BLAKE3 Key Derivation Function (KDF) mode with application context strings:
+     $$\begin{aligned}
+     K_{\text{SESSION}} &= \text{BLAKE3\_derive\_key}\Big(\text{"VRADM-v3.8-SESSION-EPOCH"}, \; \text{PSK} \,\|\, R_A \,\|\, R_B\Big) \\
+     \text{SESSION\_EPOCH} &= \text{LE32}(K_{\text{SESSION}}[0..3]) \\
+     K_{\text{CTRL\_MAC}} &= \text{BLAKE3\_derive\_key}\Big(\text{"VRADM-v3.8-CONTROL-MAC"}, \; \text{PSK} \,\|\, \text{LE32}(\text{SESSION\_EPOCH})\Big)[0..15]
+     \end{aligned}$$
+   * $K_{\text{CTRL\_MAC}}$ is a distinct 128-bit key dedicated exclusively to control-plane SipHash-2-4 MAC evaluations, eliminating cross-primitive key reuse between BLAKE3 and SipHash.
+4. **Counter Initialization:** Upon deriving `SESSION_EPOCH`:
+   * Transmitter and receiver `CTRL_COUNTER` registers are reset to 0.
+   * $c_{\text{rx\_max}}$ is reset to 0.
+   * `ANTI_REPLAY_WINDOW` bitmap is cleared.
+5. **Anti-Rollover Re-Keying Policy:**
+   * To prevent counter wrap-around vulnerabilities on the 16-bit `CTRL_COUNTER` ($2^{16} = 65,536$), endpoints track the total beacons emitted in the active session.
+   * When `CTRL_COUNTER` reaches **60,000**, the active node automatically initiates a new `SESSION_REQUEST` / `SESSION_ACCEPT` handshake cycle.
+   * A fresh `SESSION_EPOCH` is derived, the counter resets to 0, and data transfer resumes seamlessly without dropping transport-layer connections.
+
 ### 4.1 Control Plane Integrity, Anti-Replay & Threat Model Scoping (Anti-DoS)
 
 To prevent unauthorized over-the-air injection of corrupted PLCP commands, accidental cross-talk, stale replayed bursts, or malicious downgrade requests:
 
-* **Keyed Integrity Protection:** Endpoints are provisioned with a 128-bit Pre-Shared Key (PSK).
+* **Keyed Integrity Protection:** Endpoints are provisioned with a 128-bit Pre-Shared Key (PSK) from which session keys are derived via BLAKE3 KDF (§4.0).
 * **Session Freshness & Anti-Replay State:**
-  * **`SESSION_EPOCH`:** A 32-bit random session identifier exchanged during initial link handshake, binding all control frames to the active session.
+  * **`SESSION_EPOCH`:** A 32-bit random session identifier established during link handshake (§4.0), binding all control frames to the active session.
   * **`CTRL_COUNTER`:** A 16-bit monotonically increasing control counter tracked per direction, incremented on every transmitted PLCP control beacon. The low 8 bits are transmitted on the wire as `BEAC_SEQ = (uint8_t)(CTRL_COUNTER & 0xFF)`.
 * **Deterministic 16-bit `CTRL_COUNTER` Inference Algorithm (RFC 3550 / SRTP):**
   * Because only the low 8 bits of `CTRL_COUNTER` are transmitted on the wire (`BEAC_SEQ`), the receiver deterministically reconstructs the full 16-bit candidate counter $\widehat{c} \in [0..65535]$ relative to its locally tracked highest verified counter $c_{\text{rx\_max}}$ (initialized to 0 at link start) using nearest-value inference:
@@ -392,27 +491,24 @@ To prevent unauthorized over-the-air injection of corrupted PLCP commands, accid
       * If $\widehat{c} > c_{\text{rx\_max}}$, the sliding bitmap is shifted left by $(\widehat{c} - c_{\text{rx\_max}})$, bit 0 is set to 1, and $c_{\text{rx\_max}} \leftarrow \widehat{c}$.
       * If $\widehat{c} \le c_{\text{rx\_max}}$, bit $(c_{\text{rx\_max}} - \widehat{c})$ is marked as 1.
 * **`BEACON_MAC8` & `CCF_MAC` Wire Formulations:**
-  * **`BEACON_MAC8`:** An 8-bit truncated **SipHash-2-4** MAC computed over the candidate 16-bit counter $\widehat{c}$ and beacon payload:
-    $$\text{BEACON\_MAC8} = \text{Trunc8}\Big(\text{SipHash-2-4}_{\text{PSK}}\big(\text{SESSION\_EPOCH} \,\|\, \widehat{c} \,\|\, \text{CUR\_MCS} \,\|\, \text{REQ\_MCS} \,\|\, \text{TX\_PWR} \,\|\, \text{BEAC\_SEQ}\big)\Big)$$
-  * **`CCF_MAC`:** An 8-bit truncated **SipHash-2-4** MAC computed strictly over wire and session fields (bytes `0x02..0x06` bound to session epoch):
-    $$\text{CCF\_MAC} = \text{Trunc8}\Big(\text{SipHash-2-4}_{\text{PSK}}\big(\text{SESSION\_EPOCH} \,\|\, \text{CCF\_CTRL} \,\|\, \text{ACK\_BASE} \,\|\, \text{ACK\_MAP} \,\|\, \text{CCF\_CRC16}\big)\Big)$$
-    *CCF freshness and anti-replay are enforced natively by `SESSION_EPOCH` (cross-session injection defense) and the strictly monotonic forward advancement of `ACK_BASE` in the receiver's ARQ state machine (discarding stale or out-of-window acknowledgments).*
-* **Threat Model, Cryptographic Scoping & 3-Strike Lockout:**
-  * **Primary Defense via Lockout:** An 8-bit MAC tag provides 256 states. The primary operative barrier against blind over-the-air brute-force injection is the **deterministic 3-strike consecutive-failure lockout policy**: an attacker is allowed at most 3 incorrect attempts before triggering a 10.0-second silent listening backoff. The cumulative probability of a blind attacker successfully guessing a valid 8-bit MAC within 3 attempts is:
-    $$P_{\text{forge\_success}} = 1 - \left(\frac{255}{256}\right)^3 \approx 1.17\%$$
+  * **`BEACON_MAC8`:** An 8-bit truncated **SipHash-2-4** MAC computed over the candidate 16-bit counter $\widehat{c}$ and beacon payload using $K_{\text{CTRL\_MAC}}$:
+    $$\text{BEACON\_MAC8} = \text{Trunc8}\Big(\text{SipHash-2-4}_{K_{\text{CTRL\_MAC}}}\big(\text{SESSION\_EPOCH} \,\|\, \widehat{c} \,\|\, \text{CUR\_MCS} \,\|\, \text{REQ\_MCS} \,\|\, \text{TX\_PWR} \,\|\, \text{BEAC\_SEQ}\big)\Big)$$
+  * **`CCF_MAC` (16-bit Monotonic Anti-Replay Closure):** An 8-bit truncated **SipHash-2-4** MAC computed strictly over wire and session fields, binding the full 16-bit inferred control sequence $\widehat{c}_{\text{req}}$ of the burst being acknowledged:
+    $$\text{CCF\_MAC} = \text{Trunc8}\Big(\text{SipHash-2-4}_{K_{\text{CTRL\_MAC}}}\big(\text{SESSION\_EPOCH} \,\|\, \text{LE16}(\widehat{c}_{\text{req}}) \,\|\, \text{CCF\_CTRL} \,\|\, \text{ACK\_BASE} \,\|\, \text{ACK\_MAP} \,\|\, \text{CCF\_CRC16}\big)\Big)$$
+    *Because $\widehat{c}_{\text{req}} \in [0 \dots 59,999]$ is the full 16-bit inferred control counter rather than the 8-bit truncated `BEAC_SEQ`, `CCF_MAC` is mathematically unique across the entire 60,000-beacon lifetime of the session epoch. When Node A receives a CCF, it verifies that $\widehat{c}_{\text{req}}$ matches its locally recorded transmit counter for that burst ($c_{\text{tx\_last}}$). Stale CCFs from earlier turns—even if sharing the same `ACK_BASE` or 8-bit `BEAC_SEQ` wrap—produce mismatched MAC tags and are discarded before state machine processing.*
+* **Threat Model, Cryptographic Scoping & Anti-DoS Immunity:**
+  * **Elimination of Attacker-Induced Silent Lockout:** Earlier drafts enforced a silent listening backoff upon 3 consecutive MAC failures. In an adversarial wireless or acoustic environment, any unauthenticated attacker could exploit this to execute an availability Denial of Service (DoS)—muting the modem indefinitely by injecting forged frames every 10 seconds. In this specification:
+    1. Unauthenticated frames (failing `BEACON_MAC8` or `CCF_MAC`) are **silently dropped** immediately without altering modem state, receiver listening status, or ARQ windows.
+    2. The receiver **NEVER** enters a silent listening pause or halts reception on unauthenticated MAC errors.
+    3. To prevent CPU exhaustion attacks from high-rate forged frame bursts, MAC verification attempts are throttled by an internal token bucket rate limiter to $\le 10\text{ verification failures per second}$. Frames exceeding this limit are discarded before running SipHash-2-4.
+    4. Upon any MAC verification failure, the receiver increments the telemetry counter `security_tamper_detected` and emits an asynchronous warning to the host application.
   * **Strict Separation of Channel Noise from Tamper Failures:**
-    To guarantee that ordinary channel fading (such as $P_{\text{FER}} = 10^{-2}$ in TC-02) never triggers an accidental anti-DoS lockout, control frames MUST pass physical FEC and CRC integrity checks prior to MAC evaluation:
+    To guarantee that ordinary channel fading (such as $P_{\text{FER}} = 10^{-2}$ in TC-02) never registers false tamper alarms, control frames MUST pass physical FEC and CRC integrity checks prior to MAC evaluation:
     1. For PLCP Beacons: If Barker-13 sync or either Extended Golay $[24, 12, 8]$ codeword fails decoding ($>3$ bit errors), the beacon is discarded as an uncorrectable physical layer erasure (`plcp_sync_erasure`). It does NOT count as a MAC failure.
     2. For CCFs: If `SYNC_WORD`, Reed-Solomon $\text{RS}(16, 8)$ decoding ($>4$ byte errors), or CRC-16-CCITT fails, the frame is dropped as a channel transmission error (`crc_failures++`). It does NOT count as a MAC failure.
-    3. A frame is counted as a keyed integrity failure (`security_tamper_detected`) **if and only if** physical FEC and CRC verification succeed, but the SipHash-2-4 MAC check fails.
-    4. Because CRC-16 has an undetected channel error probability of $P_{\text{undetected}} \le 2^{-16} \approx 1.5 \times 10^{-5}$, the probability of random channel noise producing 3 consecutive frames that pass CRC-16 but fail SipHash is $(1.5 \times 10^{-5})^3 \approx 3.4 \times 10^{-15}$, guaranteeing zero false lockouts under legitimate fading.
+    3. A frame is counted as a keyed integrity failure (`security_tamper_detected++`) **if and only if** physical FEC and CRC verification succeed, but the SipHash-2-4 MAC check fails.
+    4. Because CRC-16 has an undetected channel error probability of $P_{\text{undetected}} \le 2^{-16} \approx 1.5 \times 10^{-5}$, the probability of random channel noise producing a frame that accidentally passes CRC-16 but fails SipHash is negligible ($< 1.5 \times 10^{-5}$ per burst erasure).
   * **L4/L7 Cryptographic Delegation:** `BEACON_MAC8` and `CCF_MAC` are keyed integrity filters and are explicitly NOT intended to provide long-term cryptographic non-repudiation. True cryptographic mutual authentication, anti-forgery, replay defense, and confidentiality are strictly anchored at the application/transport layer via **OpenSSH** (SSH-2 host keys + ChaCha20-Poly1305 / AES-256-GCM authenticated transport) and **Mosh** (128-bit AES-OCB).
-* **Anti-DoS Consecutive Failure Lockout Policy:**
-  * If $\ge 3$ consecutive frames fail SipHash-2-4 MAC verification (on FEC/CRC-valid frames) within any 60-second sliding window:
-    1. The receiver flags `security_tamper_detected = 1` in `vradm_telemetry_t`.
-    2. The receiver clamps all state-machine transitions, freezing MCS adaptation and rejecting all TDD grant changes.
-    3. The modem enters a mandatory $10.0\text{ second}$ silent backoff state (`SILENT_LISTEN`).
-    4. An asynchronous security alert is emitted to the host application.
 
 ### 4.2 Deterministic PLCP Parameters
 
@@ -509,6 +605,11 @@ In open-air acoustic conditions, simultaneous bidirectional audio triggers phone
    * Master node waits $1.5\text{ seconds}$ and re-asserts channel ownership with a standalone PLCP beacon.
 6. **Interactive Low-Latency MTU/MSS Adaptation:**
    * For interactive terminal sessions (OpenSSH keystrokes), the TCP-PEP does not wait to assemble full 256-byte datagrams; it immediately flushes individual 37-byte fragments ($N_{\text{burst}} = 1$), achieving single-keystroke turnaround in $9.165\text{ s}$. Bulk file transfers (scp/sftp) dynamically scale up to $N_{\text{burst}} = 7$.
+7. **Link-Layer In-Flight ARQ Window Cap ($W_{\text{ARQ}} = 8$):**
+   * Because `ACK_MAP` spans 7 bits ($S+1 \dots S+7$) anchored at `ACK_BASE` ($S$), the receiver can acknowledge at most 8 distinct sequence numbers ($S \dots S+7$) in any single CCF.
+   * To prevent protocol deadlocks and unacknowledged frame stalls where out-of-range frames cannot be indexed by `ACK_MAP`, the link-layer transmitter MUST strictly enforce a maximum in-flight window across all MCS modes:
+     $$W_{\text{ARQ}} \le 8\text{ frames} \quad (296\text{ bytes of L3 payload})$$
+   * Regardless of higher-layer PEP queue depths or operating MCS mode, the link layer will never transmit frame $S+8$ until `ACK_BASE` advances.
 
 ---
 
@@ -573,7 +674,7 @@ The Link Quality Metric $M$ is mathematically bounded in $[0.0, 1.0]$:
 
 $$M = 0.4 \cdot \bar{C}_{\text{sym}} + 0.3 \cdot (1.0 - P_{\text{FER}}) + 0.3 \cdot (1.0 - B)$$
 
-### 6.3 Closed-Form Retransmission Timeout (RTO)
+### 6.3 Closed-Form Retransmission Timeout (RTO) & ARQ Window Bounds
 
 $$\text{RTO} = \text{SRTT} + \max(4 \cdot \text{RTTVAR}, T_{\text{frame}}) + T_{\text{margin}}(\text{Profile})$$
 
@@ -581,6 +682,8 @@ $$\text{RTO} = \text{SRTT} + \max(4 \cdot \text{RTTVAR}, T_{\text{frame}}) + T_{
 * **Profile 2 (Free-Air Acoustic Half-Duplex with Compact ACKs):**
   * Single-Frame Cycle: Data Turn ($7.115\text{ s}$) + Guard ($0.15\text{ s}$) + CCF Turn ($1.75\text{ s}$) + Guard ($0.15\text{ s}$) = $9.165\text{ seconds}$. Nominal RTO = **$9.7\text{ seconds}$**.
   * Burst-Pipelined Cycle ($N_{\text{burst}} = 7$): Data Turn ($45.515\text{ s}$) + Guard ($0.15\text{ s}$) + CCF Turn ($1.75\text{ s}$) + Guard ($0.15\text{ s}$) = $47.565\text{ seconds}$. Nominal RTO = **$48.5\text{ seconds}$**.
+* **Link-Layer In-Flight ARQ Window Bound ($W_{\text{ARQ}} = 8$):**
+  The link-layer ARQ window is strictly bounded by the 7-bit selective repeat bitmap: $W_{\text{ARQ}} \le 8\text{ frames}$ ($296\text{ bytes}$). At MCS 3 ($165.0\text{ ms/frame}$, 33 symbols $\times 5.0\text{ ms}$) and MCS 4 ($132.0\text{ ms/frame}$, 33 slots $\times 4.0\text{ ms}$), $W_{\text{ARQ}} = 8$ frames corresponds to exactly $\mathbf{1.320\text{ seconds}}$ and $\mathbf{1.056\text{ seconds}}$ of continuous transmission respectively, which comfortably exceeds the nominal full-duplex RTO ($560\text{ ms}$), preventing channel starvation while ensuring that every in-flight frame is within the reach of `ACK_MAP`.
 * **Karn's Algorithm Mandate:** RTT updates MUST NOT be computed from retransmitted frames.
 
 ---
@@ -605,20 +708,23 @@ Standard TCP stacks interpret multi-second acoustic RTOs and half-duplex stalls 
 
 ```
 
-### 7.1 Split-Connection TCP-PEP Architecture (RFC 3135)
+### 7.1 Split-Connection TCP-PEP Architecture (RFC 3135 §2.4 & §3.1)
+
+V-RADM implements an application-transparent, transport-splitting TCP Performance Enhancing Proxy (TCP-PEP) informed by RFC 3135 §2.4 (Transport-level PEPs) and §3.1 (Split-Connection PEPs). Standard TCP stacks interpret multi-second acoustic RTOs and half-duplex stalls as congestion, collapsing $cwnd$ and retransmitting needlessly. The PEP terminates local TCP loops and feeds the acoustic link layer via an adaptive window:
 
 1. **Local Termination (Client-Side):** The iOS `PacketTunnelProvider` intercepts outbound TCP SYN packets destined for `10.99.0.1:22`. It completes the three-way handshake locally on `utun`, spoofing immediate zero-delay ACKs back to the OpenSSH client.
-2. **MCS-Adaptive Window Clamping:** Rather than using a static window clamp—which at MCS 0 represents nearly six minutes of buffered data before backpressure is noticed—the PEP dynamically clamps the advertised window based on the active MCS ladder:
+2. **MCS-Adaptive Window Clamping & Link Window Alignment:** Rather than using a static window clamp—which at MCS 0 represents nearly six minutes of buffered data before backpressure is noticed—the PEP dynamically clamps the advertised window based on the active MCS ladder. To prevent bufferbloat while strictly respecting the link-layer ARQ window ($W_{\text{ARQ}} = 8\text{ frames} = 296\text{ bytes}$), the PEP balances local staging capacity against over-the-air in-flight limits:
 
-| Active MCS | Raw Rate | App Goodput | Target Window Clamp ($W_{\text{clamp}}$) | Equivalent Slices | Max In-Flight Buffer Time |
-|---|---|---|---|---|---|
-| **MCS 0** | 80.0 bps | ~24.0 bps (3.0 B/s) | **74 bytes** | 2 frames | ~18.3 s (~2 TDD burst cycles) |
-| **MCS 1** | 400.0 bps | ~155.0 bps (19.4 B/s) | **148 bytes** | 4 frames | ~7.8 s |
-| **MCS 2** | 800.0 bps | ~330.0 bps (41.2 B/s) | **296 bytes** | 8 frames | ~7.2 s |
-| **MCS 3** | 3,200.0 bps | ~920.0 bps (115.0 B/s) | **592 bytes** | 16 frames | ~5.1 s |
-| **MCS 4** | 4,000.0 bps | ~1,450.0 bps (181.2 B/s) | **1,036 bytes** | 28 frames | ~5.7 s |
+| Active MCS | Raw Rate | App Goodput | Target Window Clamp ($W_{\text{clamp}}$) | Local Staging Slices | Max Over-The-Air In-Flight ($W_{\text{ARQ}}$) | Max In-Flight Buffer Time |
+|---|---|---|---|---|---|---|
+| **MCS 0** | 80.0 bps | ~24.0 bps (3.0 B/s) | **74 bytes** | 2 frames | 2 frames (74 B) | ~18.3 s (~2 TDD burst cycles) |
+| **MCS 1** | 400.0 bps | ~155.0 bps (19.4 B/s) | **148 bytes** | 4 frames | 4 frames (148 B) | ~7.8 s |
+| **MCS 2** | 800.0 bps | ~330.0 bps (41.2 B/s) | **296 bytes** | 8 frames | 8 frames (296 B) | ~7.2 s |
+| **MCS 3** | 3,200.0 bps | ~920.0 bps (115.0 B/s) | **592 bytes** | 16 frames | 8 frames (296 B) | ~5.1 s |
+| **MCS 4** | 4,000.0 bps | ~1,450.0 bps (181.2 B/s) | **1,036 bytes** | 28 frames | 8 frames (296 B) | ~5.7 s |
 
    * TCP window scaling is suppressed across all modes.
+   * **Staging vs. Over-The-Air In-Flight Separation:** For high-throughput modes (MCS 3 and MCS 4), $W_{\text{clamp}}$ allows up to 16 and 28 frames in the local PEP socket staging queue to prevent client application write stalls during bulk transfers. However, the link layer transmitter strictly paces transmission so that at most $W_{\text{ARQ}} = 8\text{ frames}$ ($296\text{ bytes}$) are in-flight over the acoustic medium at any time, exactly matching the 7-bit selective repeat coverage of `ACK_MAP`.
    * When the modem transitions MCS, the PEP dynamically updates the Advertised Window field in subsequent spoofed ACKs, bounding the client's unacknowledged queue to between $5\text{ and }18\text{ seconds}$ across the entire rate ladder.
 3. **Link Slicing:** Plaintext stream bytes are packed directly into 37-byte fragments (`BEST_EFFORT = 0`) handled by V-RADM's link-layer Selective Repeat ARQ.
 4. **Symmetric Server-Side TCP-PEP (`vradmd` $\leftrightarrow$ `sshd`):**
@@ -628,12 +734,12 @@ Standard TCP stacks interpret multi-second acoustic RTOs and half-duplex stalls 
    * **Symmetric Rehydration:** Received downlink fragments are reassembled by the client-side PEP in `PacketTunnelProvider` and injected into the local `utun` interface.
 5. **UDP Passthrough (Mosh):** Mosh traffic bypasses the TCP-PEP entirely. Packets are flagged with `BEST_EFFORT = 1`, bypassing ARQ retransmissions to let Mosh's state synchronization handle loss natively.
 
-### 7.1.1 TCP-PEP Conformance Contract & State-Machine Subset (RFC 3135)
+### 7.1.1 TCP-PEP State-Machine Contract (RFC 3135 §2.4 / §3.1 Terminology)
 
-To ensure reliable, deterministic operation across high-latency, asymmetric acoustic links without running an unnecessarily complex TCP stack in kernel or extension space, V-RADM implements an RFC 3135 Section 3.8.1 (Split-Connection PEP) conforming minimal state-machine subset:
+To ensure reliable, deterministic operation across high-latency, asymmetric acoustic links without running an unnecessarily complex TCP stack in kernel or extension space, V-RADM implements an application-transparent split-connection TCP-PEP informed by RFC 3135:
 
 1. **Local Three-Way Handshake Termination (Fast SYN/ACK Spoofing):**
-   * Upon intercepting an outbound TCP SYN packet from the local client (`OpenSSH`), the client-side PEP immediately generates a synthetic `SYN+ACK` segment (with zero synthetic RTT, initial sequence number $ISN_0 = 0$).
+   * Upon intercepting an outbound TCP SYN packet from the local client (`OpenSSH`), the client-side PEP immediately generates a synthetic `SYN+ACK` segment (with zero synthetic RTT, negotiating an RFC 6528 / RFC 9293 cryptographically pseudo-random Initial Sequence Number: $\text{ISN} \leftarrow \text{CSPRNG}(32)$).
    * **TCP Option Stripping:** The PEP forces clean baseline negotiation by stripping `WSCALE` (Window Scale, RFC 7323), `TSopt` (TCP Timestamps, RFC 7323), and `SACK-Permitted` (RFC 2018) from both client and server SYN packets.
    * **MSS Clamping:** The Maximum Segment Size (MSS) option is clamped to **216 bytes** ($\text{MTU}_{256} - 40\text{ bytes}$ for IPv4/TCP headers), guaranteeing that generated TCP segments fit within a single 7-fragment burst without secondary fragmentation.
 2. **Transparent FIN Propagation & Half-Closed State:**
@@ -710,36 +816,46 @@ SOTP handles unidirectional broadcast data drops (RFC 6330 RaptorQ compliant). S
  └────────────────────────────────────────────────────────┘
   Byte 0x00:       DESC_MARKER (0xFE)
   Byte 0x01:       OBJECT_ID (8 bits)
-  Bytes 0x02..0x03: EXTENDED_SOURCE_SYMBOLS (K', 16 bits)
+  Bytes 0x02..0x03: SYMBOL_SIZE_T (16 bits, fixed to 32)
   Bytes 0x04..0x05: TOTAL_SOURCE_BLOCKS (Z, 16 bits, 1 <= Z <= 255)
   Bytes 0x06..0x09: TOTAL_BYTES (F, 32 bits, uncompressed file size)
   Bytes 0x0A..0x25: BLAKE3_224 (Leading 28 bytes [224 bits] of BLAKE3 checksum)
 
 ```
 
-### 8.1 RFC 6330 Object Transmission Information (OTI) & Symbol Partitioning
+### 8.1 RFC 6330 Object Transmission Information (OTI) & Deterministic Partitioning
 
 To ensure deterministic encoding and decoding between independent RFC 6330 RaptorQ implementations, all SOTP sessions adhere strictly to the following parameters:
 
 * **Common OTI Parameter Set:**
-  * **Transfer Length ($F$):** Total transfer size in octets ($0 \le F < 2^{32}$), conveyed in Manifest bytes `0x06..0x09`.
-  * **Symbol Size ($T$):** Exactly **32 bytes** ($\text{Al} = 4$).
+  * **Transfer Length ($F$):** Total transfer size in octets, strictly bounded within:
+    $$1 \le F \le 460,248,480\text{ octets} \quad (\sim 438.9\text{ MiB})$$
+    Empty objects ($F = 0$) are explicitly prohibited and rejected by the decoder ($K_t \ge 1$, $Z \ge 1$). The upper bound is mathematically derived from the maximum symbol partition: $Z_{\text{max}} \times K_{\text{max}} \times T = 255 \times 56,403 \times 32 = 460,248,480\text{ bytes}$. Conveyed in Manifest bytes `0x06..0x09`.
+  * **Symbol Size ($T$):** Exactly **32 bytes** ($\text{Al} = 4$), conveyed in Manifest bytes `0x02..0x03`.
   * **Symbol Alignment ($\text{Al}$):** **4 bytes** (guaranteeing 32-bit hardware alignment across platforms).
   * **Number of Sub-Blocks ($N$):** **1** (sub-blocking disabled; $T = 32$ fits inside a single cache line).
-  * **Number of Source Blocks ($Z$):** $1 \le Z \le 255$ (Manifest bytes `0x04..0x05`; byte 0x04 is `0x00`, byte 0x05 holds $Z$).
+  * **Number of Source Blocks ($Z$):** $1 \le Z \le 255$ (Manifest bytes `0x04..0x05`; byte `0x04` is `0x00`, byte `0x05` holds $Z$).
   * **Maximum Source Symbols per Block ($K_{\text{max}}$):** **56,403** (RFC 6330 ceiling).
-* **Source Block Partitioning (RFC 6330 §4.4.1.2):**
+  * **Network Byte Order (Big-Endian):** In strict accordance with RFC 6330 §3.2, all multi-byte fields across SOTP Data Frames and Metadata Manifests (`SYMBOL_SIZE_T`, `TOTAL_SOURCE_BLOCKS`, `TOTAL_BYTES`, `FEC_PAYLOAD_ID`) SHALL be transmitted in **network byte order (Big-Endian)**.
+* **Deterministic Source Block Partitioning (RFC 6330 §4.4.1.2):**
   * Total source symbols: $K_t = \lceil F / T \rceil$.
   * Number of source blocks: $Z = \lceil K_t / K_{\text{max}} \rceil$.
   * Partitioning calculation:
     $$K_L = \lceil K_t / Z \rceil, \quad K_S = \lfloor K_t / Z \rfloor, \quad J = K_t - Z \cdot K_S$$
-  * Exactly $J$ source blocks contain $K_L$ source symbols, and $Z - J$ source blocks contain $K_S$ source symbols.
-  * For each block, the extended source block size $K'$ is the smallest systematic block size from RFC 6330 Table 2 such that $K' \ge K$. Padded symbols ($K' - K$) are zero-filled by the encoder and are never transmitted over the air.
+  * Exactly $J$ source blocks contain $K_L$ source symbols (blocks $0 \le i < J$), and $Z - J$ source blocks contain $K_S$ source symbols (blocks $J \le i < Z$).
+  * For each block $i \in [0 \dots Z-1]$:
+    $$K_i = \begin{cases} K_L, & 0 \le i < J \\ K_S, & J \le i < Z \end{cases}$$
+  * For each block, the extended source block size $K'_i$ is looked up independently as the smallest systematic block size from RFC 6330 Table 2 such that $K'_i \ge K_i$.
+* **Two-Level Padding Rules:**
+  1. **Object-Length Zero-Padding (Final Source Symbol):** If $F \pmod T \ne 0$, the final source symbol of the transfer (symbol $K_{Z-1}-1$ in block $Z-1$) is padded with $T - (F \pmod T)$ zero octets (`0x00`). This padding octet sequence is part of the encoded symbol and is transmitted over the air.
+  2. **Systematic Extended Block Padding (Virtual Symbols):** For each block $i$, the encoder appends $K'_i - K_i$ virtual zero symbols of size $T$. These virtual symbols are utilized internally by the RaptorQ matrix encoding/decoding arithmetic, but they are **virtual**: they are **NEVER transmitted over the air** and are **NEVER included in object hash computations**.
 * **FEC Payload ID (RFC 6330 §3.2):**
   * Conveys the 8-bit Source Block Number (`SBN`) and 24-bit Encoding Symbol ID (`ESI`).
-  * Source symbols have $0 \le \text{ESI} < K$; repair symbols have $K \le \text{ESI} < 2^{24}-1$.
+  * For block $i$:
+    * Source symbols have $0 \le \text{ESI} < K_i$.
+    * Repair symbols have $K_i \le \text{ESI} < 2^{24}$.
 * **Object Integrity (`BLAKE3_224`):**
-  * Manifest bytes `0x0A..0x25` contain `BLAKE3_224`, defined as the first 28 bytes (224 bits) of the standard 32-byte BLAKE3 hash computed over the reconstructed $F$ bytes.
+  * Manifest bytes `0x0A..0x25` contain `BLAKE3_224`, defined strictly as the first 28 bytes (224 bits) of the standard 32-byte BLAKE3 hash computed over the reconstructed $F$ bytes (`bytes[0..F-1]`). The zero padding in the final symbol is excluded from hash evaluation.
 * **Manifest Transmission Cadence:**
   * SOTP Metadata Manifest frames are interleaved every 8 physical frames. A newly attached receiver requires at most 8 frames to acquire object metadata and begin RaptorQ symbol accumulation.
 
@@ -787,8 +903,9 @@ AudioSocket Client TCP:9099 ──> Thread Worker ──> vradm_create() ──>
 exten => 774,1,NoOp(Incoming V-RADM Carrier Link)
 same  => n,Answer()
 same  => n,GotoIf($["${CALLERID(num)}" != "+15550198372"]?reject)
-; Hand off 8kHz linear PCM to vradmd TCP daemon (uuid,service) using dynamic unique channel ID
-same  => n,AudioSocket(${CHANNEL(uniqueid)},127.0.0.1:9099)
+; Hand off 8kHz linear PCM to vradmd TCP daemon (uuid,service) using dynamic RFC 4122 UUID
+same  => n,Set(SOCKET_UUID=${UUID()})
+same  => n,AudioSocket(${SOCKET_UUID},127.0.0.1:9099)
 same  => n,Hangup()
 same  => n(reject),NoOp(Unauthorized Call Dropped)
 same  => n,Hangup()
@@ -826,8 +943,8 @@ The iOS architecture strictly separates the untrusted network packet processing 
 
 5. **iOS Background Execution & Lifecycle Constraints:**
    * **`UIBackgroundModes`:** The Main App `Info.plist` declares `UIBackgroundModes` containing `audio` (`<string>audio</string>`).
-   * **Audio Session Configuration:** The app initializes `AVAudioSession.sharedInstance()` with category `.playAndRecord`, mode `.measurement`, and options `[.allowBluetooth, .mixWithOthers]`. Mode `.measurement` is strictly mandated because it suppresses OS-level automatic gain control (AGC), high-pass filtering, acoustic echo cancellation (AEC), and dynamic range compression on a best-effort basis, preserving the linear fidelity of multi-carrier acoustic waveforms. Background execution is preserved under `UIBackgroundModes = ["audio"]`, where continuous execution of the real-time audio render callback prevents iOS from suspending the Main App process when backgrounded or when the device screen is locked.
-   * **NetworkExtension Lifecycle:** `PacketTunnelProvider` executes in its own sandboxed daemon process managed directly by iOS `nesessionmanager`. Because the VPN tunnel remains active, the extension is not subject to standard app suspension, maintaining unbroken IP packet flow across the shared memory ring buffer while audio is running.
+   * **Audio Session Configuration:** The app initializes `AVAudioSession.sharedInstance()` with category `.playAndRecord`, mode `.measurement`, and options `[.allowBluetooth, .mixWithOthers]`. Mode `.measurement` requests the least-processed audio path available for the selected route; OS-level dynamics processing, automatic gain control (AGC), and acoustic echo cancellation (AEC) are suppressed on a best-effort basis. Because hardware audio pipelines across Apple devices and accessory routes (built-in speakerphone vs. wired Lightning/USB-C dongle) can exhibit device-dependent pre-emphasis or non-linear limiter behaviors, remaining route-specific hardware processing SHALL be characterized empirically per target device model. Background execution is preserved under `UIBackgroundModes = ["audio"]`, where continuous execution of the real-time audio render callback prevents iOS from suspending the Main App process when backgrounded or when the device screen is locked.
+   * **NetworkExtension Lifecycle:** The NetworkExtension provider maintains packet handling while its tunnel session is active. Tunnel termination or provider restart is treated as a recoverable lifecycle event; the shared-memory protocol must tolerate producer/consumer disappearance and reattachment.
 
 ---
 
@@ -865,35 +982,105 @@ typedef uint32_t vradm_rate_t;
 
 typedef struct vradm_engine vradm_engine_t;
 
-typedef struct {
-    vradm_mcs_t  startup_mcs;
-    uint8_t      reserved[3];
-    vradm_rate_t sample_rate;
-    uint8_t      auto_rate_adaptation;
-    uint8_t      psk_key[16]; // 128-bit Pre-Shared Key for PLCP/CCF MAC
-    uint8_t      padding[3];
-    float        tx_amplitude; // Target RMS ceiling (Default: 0.3535 = -9.0 dBFS RMS)
-} vradm_config_t;
+/* =========================================================================
+ * Struct Definitions (Strict Fixed-Width Alignment)
+ * ========================================================================= */
 
 typedef struct {
-    float       estimated_snr_db;
-    vradm_mcs_t active_tx_mcs;
-    vradm_mcs_t active_rx_mcs;
-    uint8_t     plcp_carrier_locked;
-    uint8_t     security_tamper_detected; // Flagged (1) when >= 3 consecutive MAC failures occur in 60s
-    uint32_t    frames_transmitted;
-    uint32_t    frames_received;
-    uint32_t    rs_corrected_bytes;
-    uint32_t    rs_corrected_erasures;
-    uint32_t    crc_failures;
-    float       channel_metric_score;
-    int32_t     sample_slip_accum; // Cumulative sample slips corrected by DLL
-} vradm_telemetry_t;
+    vradm_mcs_t  startup_mcs;          // [0]
+    uint8_t      reserved[3];          // [1..3]
+    vradm_rate_t sample_rate;          // [4..7]
+    uint8_t      auto_rate_adaptation; // [8]
+    uint8_t      psk_key[16];          // [9..24] 128-bit Pre-Shared Key for PLCP/CCF MAC
+    uint8_t      padding[3];           // [25..27]
+    float        tx_amplitude;         // [28..31] Target RMS ceiling (Default: 0.3535 = -9.0 dBFS RMS)
+} vradm_config_t; // Exactly 32 bytes
 
-/* --- Engine Lifecycle Management (Thread-Safe & Fully Reentrant) --- */
+typedef struct {
+    float       estimated_snr_db;         // [0..3]
+    vradm_mcs_t active_tx_mcs;            // [4]
+    vradm_mcs_t active_rx_mcs;            // [5]
+    uint8_t     plcp_carrier_locked;      // [6]
+    uint8_t     reserved;                 // [7] Struct padding
+    uint32_t    security_tamper_detected; // [8..11] Cumulative counter of invalid PLCP/CCF MAC drops
+    uint32_t    frames_transmitted;       // [12..15]
+    uint32_t    frames_received;          // [16..19]
+    uint32_t    rs_corrected_bytes;       // [20..23]
+    uint32_t    rs_corrected_erasures;    // [24..27]
+    uint32_t    crc_failures;             // [28..31]
+    float       channel_metric_score;     // [32..35]
+    int32_t     sample_slip_accum;        // [36..39] Cumulative sample slips corrected by DLL
+} vradm_telemetry_t; // Exactly 40 bytes
+
+typedef enum {
+    VRADM_CMD_NONE = 0,
+    VRADM_CMD_START_SOTP,
+    VRADM_CMD_STOP_SOTP,
+    VRADM_CMD_REQUEST_MCS,
+    VRADM_CMD_RESET_SESSION,
+    VRADM_CMD_SET_TX_PARAMS
+} vradm_cmd_type_t;
+
+typedef struct {
+    vradm_cmd_type_t type;
+    uint8_t          target_mcs;
+    uint8_t          reserved[3];
+    float            param_float;
+    const void*      data_ptr;
+    size_t           data_len;
+} vradm_cmd_t;
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(vradm_config_t) == 32, "vradm_config_t size mismatch: expected 32 bytes");
+_Static_assert(sizeof(vradm_telemetry_t) == 40, "vradm_telemetry_t size mismatch: expected 40 bytes");
+_Static_assert(offsetof(vradm_config_t, psk_key) == 9, "vradm_config_t: psk_key offset mismatch");
+_Static_assert(offsetof(vradm_telemetry_t, security_tamper_detected) == 8, "vradm_telemetry_t: security_tamper_detected offset mismatch");
+_Static_assert(offsetof(vradm_telemetry_t, sample_slip_accum) == 36, "vradm_telemetry_t: sample_slip_accum offset mismatch");
+#endif
+
+/* =========================================================================
+ * Thread Ownership & Concurrency Contract
+ * =========================================================================
+ * 1. Audio Render Thread (Real-Time Audio Priority):
+ *    - Exclusively calls vradm_process_audio() and vradm_generate_audio().
+ *    - Guarantees: Non-blocking execution, zero heap allocations (malloc/free),
+ *      zero mutex/condition variable blocking, lock-free SPSC polling.
+ *    - Constraint: MUST NOT be called concurrently with itself on the same engine.
+ *    - Applies queued host commands (vradm_cmd_t) deterministically at audio
+ *      frame boundaries.
+ *
+ * 2. Host Network / Worker Thread:
+ *    - Calls vradm_write_ip_packet(), vradm_poll_ip_packet(), and vradm_submit_cmd().
+ *    - Safe to invoke concurrently with the Audio Render Thread on the same engine;
+ *      data exchange is internally decoupled via lock-free SPSC ring buffers.
+ *    - Control mutations (SOTP start/stop, MCS commit requests, and session resets)
+ *      are submitted via vradm_submit_cmd() into the host->audio SPSC queue rather
+ *      than modifying shared modulator state directly.
+ *
+ * 3. Telemetry / Diagnostics Thread:
+ *    - Calls vradm_get_telemetry().
+ *    - Safe to invoke concurrently from any thread at any time.
+ *    - Coherent Seqlock Snapshot Protocol: The engine maintains a monotonically
+ *      increasing 32-bit sequence counter (seq). The writer increments seq to an
+ *      odd value prior to modifying telemetry fields and increments seq to an even
+ *      value upon completion. The reader samples seq1, copies the 40-byte struct,
+ *      and samples seq2, accepting the snapshot if and only if (seq1 == seq2 && (seq1 & 1) == 0).
+ *      This guarantees tear-free atomic snapshots without mutex contention.
+ *
+ * 4. Engine Lifecycle Operations:
+ *    - vradm_create(), vradm_reset(), vradm_destroy().
+ *    - Strictly prohibited while audio callbacks or network polling threads are
+ *      active on the instance. Calling vradm_destroy() concurrently with audio
+ *      processing produces undefined behavior.
+ * ========================================================================= */
+
+/* --- Engine Lifecycle Management (Thread-Safe under Single-Owner Discipline) --- */
 vradm_engine_t* vradm_create(const vradm_config_t* config);
 void            vradm_destroy(vradm_engine_t* engine);
 void            vradm_reset(vradm_engine_t* engine);
+
+/* --- Asynchronous Host Command Queue (Lock-Free SPSC) --- */
+int32_t vradm_submit_cmd(vradm_engine_t* engine, const vradm_cmd_t* cmd);
 
 /* --- Real-Time Audio Streaming I/O (Zero Dynamic Allocations) --- */
 void   vradm_process_audio(vradm_engine_t* engine, const int16_t* in_samples, size_t count);
@@ -908,7 +1095,7 @@ int32_t vradm_sotp_tx_init(vradm_engine_t* engine, const uint8_t* payload, size_
 int32_t vradm_sotp_rx_poll(vradm_engine_t* engine, size_t* out_collected_symbols, size_t* out_required_symbols);
 int32_t vradm_sotp_rx_fetch(vradm_engine_t* engine, uint8_t* out_buf, size_t max_len, uint8_t out_hash[28]); // 28-byte BLAKE3_224 digest
 
-/* --- Telemetry & Link Status --- */
+/* --- Telemetry & Link Status (Seqlock Coherent Snapshot) --- */
 void vradm_get_telemetry(const vradm_engine_t* engine, vradm_telemetry_t* out_telem);
 
 #ifdef __cplusplus
@@ -942,15 +1129,19 @@ void vradm_get_telemetry(const vradm_engine_t* engine, vradm_telemetry_t* out_te
 | **TC-01** | Math Loopback | In-memory loopback | Zero noise, synchronous clock | Zero observed bit errors over $30 \times 10^6$ tested bits ($\implies P_e \le 1.0 \times 10^{-7}$ at 95% Clopper-Pearson confidence). Zero RS corrections. |
 | **TC-02** | AMR-NB Robustness | AMR-NB @ 12.2 kbps | Injected channel erasure rate = 1.0%; AWGN $\text{SNR} = 18\text{ dB}$ | Zero unrecoverable frames over 30,000 frames ($\implies P_{\text{FER}} \le 1.0 \times 10^{-4}$ at 95% Clopper-Pearson confidence). Zero payload corruption. |
 | **TC-03** | Dynamic Codec Adaptation | AMR-NB stepped down from 12.2k to 4.75k | Mode switch occurs at Frame 100 | Link metric $M$ initiates automatic downshift to MCS 1 within 4 frames. Zero dropped IP packets. |
-| **TC-04** | Wideband Cabled Gate | AMR-WB @ 12.65 kbps | Resampling $16\text{k} \to 8\text{k} \to 16\text{k}$; $\pm 80\text{ PPM}$ clock drift | DPLL and DLL maintain lock. Measured Application Goodput $R_{\text{APP}} \ge 850\text{ bps}$ for SSH/TCP-PEP or $\ge 1,100\text{ bps}$ for UDP bulk stream. |
+| **TC-04a** | Balanced Cellular Gate (MCS 2) | AMR-NB @ 12.2 kbps | Injected channel $\text{SNR} = 18\text{ dB}$, clock drift $\pm 50\text{ PPM}$ | Multi-carrier 4th-power NDA DLL maintains phase-aligned carrier and timing lock. Measured Application Goodput $R_{\text{APP}} \ge 250\text{ bps}$ for SSH/TCP-PEP or $\ge 320\text{ bps}$ for UDP bulk stream (against theoretical L3 maximum $431.92\text{ bps}$). $P_{\text{FER}} \le 1.0 \times 10^{-3}$. Zero RS decode crashes. |
+| **TC-04b** | Wideband Cellular Cabled Gate (MCS 3) | AMR-WB @ 12.65 kbps | Resampling $16\text{k} \to 8\text{k} \to 16\text{k}$; $\pm 80\text{ PPM}$ clock drift | DPLL and DLL maintain lock. Measured Application Goodput $R_{\text{APP}} \ge 850\text{ bps}$ for SSH/TCP-PEP or $\ge 1,100\text{ bps}$ for UDP bulk stream. $P_{\text{FER}} \le 1.0 \times 10^{-3}$. Zero RS decode crashes. |
 | **TC-05** | VAD & AGC Verification | 3GPP VAD Model 1 & 2 + Smartphone AGC model | PRBS-7 phase dither enabled; voiced maintenance carrier active | Measured over 10,000 independent 1-second trials. False DTX entry $P_{\text{DTX}} \le 0.01$. Zero AGC signal-clamping events. Dither-induced FER degradation $\Delta P_{\text{FER}} \le 0.5\%$ ($\le 0.005$) compared to un-dithered transmission. |
 | **TC-06** | Burst Erasure Recovery | MCS 3 (165 ms frames) | 3 consecutive physical frame drops ($495\text{ ms}$ drop) | Selective Repeat ARQ triggers fast retransmission. Complete IP packet stream recovery within $\le \mathbf{1,450\text{ ms}}$ of drop start. Zero application errors. |
 | **TC-07** | SOTP Mid-Stream Entry | AMR-WB @ 12.65 kbps | Receiver attaches at Frame 40 of a 100-symbol broadcast | Receiver syncs via Metadata Manifest within 8 frames. Object reconstructs with matching BLAKE3_224 checksum. |
 | **TC-08a** | Real VoLTE Cellular Call (MCS 3) | Commercial Mobile VoLTE Network | Active 15-minute phone call between iPhone and Asterisk server | Interactive OpenSSH/TCP-PEP session maintained continuously. Keystroke round-trip confirmation time $\le 550\text{ ms}$. |
 | **TC-08b** | Real Degraded / Free-Air Link (MCS 0/1) | Acoustic Speaker-to-Mic Air Gap / Degraded 3G Call | High ambient acoustic noise and multi-second frame periods | Mosh UDP terminal session maintained continuously. Predictive local echo renders keystrokes with $< 50\text{ ms}$ UI latency; remote screen converges within $1.5 \times T_{\text{frame}}$ after burst recovery. |
 | **TC-09** | Concurrency & Thread-Safety | 8 concurrent AudioSocket TCP threads | Multi-channel load test on Linux daemon | Zero cross-session cross-talk, race conditions, or memory corruption. CPU scaling linear across threads. |
-| **TC-10** | Sample-Slip Resilience & Squaring-Loss Sweep | MCS 2, MCS 3, and MCS 4 loopback | Injected random single-sample slips ($\pm 1$ sample every $500\text{ ms}$) across SNR sweep down to demotion threshold ($\text{SNR} \in [8\text{ dB}, 18\text{ dB}]$) | Multi-carrier 4th-power NDA DLL corrects slips within $\le 2.5\text{ ms}$. Multi-carrier array combining prevents squaring-loss unlock and decision-directed error cascades. Peak-constrained gain bounds soft-limiter activation to $< 0.05\%$ of samples; measured composite multicarrier EVM degradation due to limiter non-linearity is $\le 0.5\text{ dB}$ (EVM $\le -22\text{ dB}$ across MCS 2 and MCS 3). Constellation lock maintained without frame loss down to $M = 0.60$. |
-| **TC-10b** | Continuous Clock Drift Tracking | MCS 2, MCS 3, and MCS 4 cabled loopback | Injected continuous clock offset $\Delta F_s / F_s \in \{\pm 20, \pm 40, \pm 80, \pm 100\}\text{ PPM}$ across 10,000 frames | Farrow 3rd-order resampler and 4th-power NDA DLL dynamic tracking maintain synchronization without buffer overflow/underflow or bit slips. $P_{\text{FER}} \le 1.0 \times 10^{-4}$. Zero unrecoverable frame loss. |
+| **TC-10a** | Symbol Timing & Phase-Slope Detector | MCS 2, MCS 3, and MCS 4 loopback | Injected random single-sample slips ($\pm 1$ sample every $500\text{ ms}$) across SNR sweep down to demotion threshold ($\text{SNR} \in [8\text{ dB}, 18\text{ dB}]$) | For MCS 2 and MCS 3: Inter-carrier 4th-power phase-slope timing detector ($\hat{\tau} \propto -\partial\angle q_k/\partial f_k$) and complex baseband transition detector resolve slips within $\le 2.5\text{ ms}$ ($< 1$ symbol interval). For MCS 4: Cyclic-prefix correlation detector resolves slips within $\le 2.5\text{ ms}$. Zero bit slips; Farrow fractional resampler tracks phase step without symbol decoding failure. |
+| **TC-10b** | 4th-Power Carrier Tracking & MRC Threshold | MCS 2 and MCS 3 loopback | Static carrier frequency offsets up to $\pm 12.5\text{ Hz}$ across SNR sweep ($8\text{ dB} \dots 20\text{ dB}$) | Phase-aligned MRC coherent combining achieves power-weighted squaring-loss mitigation gain: $\ge +5.74\text{ dB}$ for MCS 2 (4 carriers) and $\ge +7.56\text{ dB}$ for MCS 3 (8 carriers) calculated from profile amplitude weighting $(\sum A_k^2)^2 / \sum A_k^4$, or $+6.02\text{ dB}$ and $+9.03\text{ dB}$ under equal-power AWGN calibration ($10\log_{10} Z$). Carrier phase tracking lock maintained without cycle slipping down to channel metric demotion threshold $M = 0.60$. |
+| **TC-10c** | Limiter Activation & Multicarrier EVM | MCS 2, MCS 3, and MCS 4 composite multicarrier waveforms at nominal and worst-case crest-factor alignments | Nominal RMS targets with rare crest-factor transients | Peak-constrained normalization bounds soft-limiter activation rate to $< 0.05\%$ of samples. Measured composite multicarrier EVM degradation due to limiter non-linearity is $\le 0.5\text{ dB}$ (EVM $\le -22\text{ dB}$ across MCS 2 and MCS 3, EVM $\le -24\text{ dB}$ for MCS 4). |
+| **TC-10d** | Continuous Sample Clock Drift Tracking | MCS 2, MCS 3, and MCS 4 cabled loopback | Continuous clock offset $\Delta F_s / F_s \in \{\pm 20, \pm 40, \pm 80, \pm 100\}\text{ PPM}$ | *CI Smoke Tier (2,000 frames):* Farrow 3rd-order resampler and DLL dynamic tracking maintain synchronization without buffer overflow/underflow or bit slips. $P_{\text{FER}} \le 1.0 \times 10^{-4}$. Zero unrecoverable frame loss.<br>*Hardware Qualification Tier (10,000 frames):* Continuous lock over physical streaming durations without cumulative phase drift or frame loss: $108.3\text{ minutes}$ ($6,500\text{ s}$) for MCS 2, $27.5\text{ minutes}$ ($1,650\text{ s}$) for MCS 3, and $22.0\text{ minutes}$ ($1,320\text{ s}$) for MCS 4. |
+| **TC-11** | G.711 VoIP Codec-in-the-Loop Gate (MCS 4) | G.711 $\mu$-law / A-law companding over simulated VoIP network | 20 ms RTP packetization, $\sigma = 5.0\text{ ms}$ packet arrival jitter absorbed by $40\text{ ms}$ playout jitter buffer; 1.0% random packet loss triggering standard G.711 Appendix I Packet Loss Concealment (PLC) waveform synthesis distortion; $\pm 50\text{ PPM}$ clock skew | Reed-Solomon RS(64,48) with GMD soft-decision erasure tagging recovers dropped/distorted packet slices in conjunction with Selective Repeat ARQ. Measured Application Goodput $R_{\text{APP}} \ge 1,200\text{ bps}$ for SSH/TCP-PEP or $\ge 1,450\text{ bps}$ for UDP bulk stream (against theoretical L3 maximum $1,769.14\text{ bps}$). $P_{\text{FER}} \le 1.0 \times 10^{-3}$. |
 
 ---
 
@@ -958,7 +1149,7 @@ void vradm_get_telemetry(const vradm_engine_t* engine, vradm_telemetry_t* out_te
 
 1. **Workspace Layout:** Scaffold a Cargo workspace with `crates/vradm-core` (`#![no_std]` core with `alloc` for initialization), `crates/vradm-server` (multi-threaded Asterisk daemon), `crates/vradm-cli` (diagnostics), and `tests/vocoder_bench`.
 2. **Wire Format Verification:** Implement `crates/vradm-core/src/link/frame.rs` and verify bit-exact layout of both the 64-byte Canonical Data Frame and 16-byte Authenticated Compact Control Frame.
-3. **PLCP Bootstrap & Authentication:** Implement the Barker-13 dual-chirp generator, dual Extended Golay $[24, 12, 8]$ codecs, SipHash-2-4 control plane MAC with consecutive-failure lockout, and 2-FSK modulator.
-4. **Carrier & Timing Recovery (4th-Power NDA DLL):** Implement multi-carrier 4th-power phase extraction and diversity combining across all active subcarriers, symbol-boundary transient exclusion zones, and fractional Farrow resampler in `crates/vradm-core/src/phy/dll.rs`.
+3. **PLCP Bootstrap & Authentication:** Implement the Barker-13 dual-chirp generator, dual Extended Golay $[24, 12, 8]$ codecs, SipHash-2-4 control plane MAC with DoS-immune token bucket rate limiting and silent drops, and 2-FSK modulator.
+4. **Carrier & Timing Recovery (4th-Power NDA DLL):** Implement multi-carrier 4th-power phase extraction, inter-carrier phase-slope timing error detector ($\hat{\tau} \propto -\partial\angle q_k/\partial f_k$), phase-aligned MRC coherent combining, symbol-boundary transient exclusion zones, and fractional Farrow resampler in `crates/vradm-core/src/phy/dll.rs`.
 5. **Soft-Decision RS Decoder:** Implement Chase/GMD soft-decision decoding in `crates/vradm-core/src/fec/rs.rs`, verifying that flagging 16 confidence-tagged erasures reconstructs corrupted frames under $2t + e \le 16$.
-6. **Continuous Codec Validation:** Execute `tests/vocoder_bench` continuously against `libopencore-amr` and `vo-amrwbenc` before packaging C-ABI exports. Ensure zero regressions across tests TC-01 through TC-10b prior to platform deployment.
+6. **Continuous Codec Validation:** Execute `tests/vocoder_bench` continuously against `libopencore-amr`, `vo-amrwbenc`, and G.711 before packaging C-ABI exports. Ensure zero regressions across tests TC-01 through TC-11 prior to platform deployment.
