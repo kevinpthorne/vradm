@@ -1,0 +1,26 @@
+#[path = "src/fec.rs"]
+mod fec;
+
+fn main() {
+    let info_bytes: [u8; 48] = [
+        0x56, 0x52, 0x41, 0x44, 0x4D, 0x5F, 0x54, 0x45, 0x53, 0x54, 0x5F, 0x46, 0x52, 0x41, 0x4D, 0x45,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+    ];
+    let codeword = fec::rs_encode_64_48(&info_bytes);
+    
+    // Test 6: 16 erasures + 1 error (s=1, e=16). 2*1 + 16 = 18 > 16. Should fail.
+    let mut corrupted = codeword.clone();
+    let mut erasures = Vec::new();
+    for i in 0..16 {
+        corrupted[i * 2] ^= 0x55;
+        erasures.push(i * 2);
+    }
+    corrupted[50] ^= 0xAA; // 1 error not in erasures
+    let res = fec::rs_decode_64_48(&mut corrupted, &erasures);
+    println!("Decode result: {:?}", res);
+    println!("Codeword equal? {}", corrupted == codeword);
+    if corrupted != codeword {
+        println!("Codeword NOT recovered correctly but returned Ok(())");
+    }
+}
