@@ -1,6 +1,6 @@
 # Engineering Specification: Vocoder-Resilient Acoustic Data Modem (V-RADM)
 
-**Document Version:** 3.8.6
+**Document Version:** 3.8.8
 
 **Status:** Closed Baseline Engineering Specification (Implementation-Ready Research Prototype)
 
@@ -10,10 +10,15 @@
 
 ## 1. System Architecture & Process Boundaries
 
-
 V-RADM provides transparent application connectivity across speech-compressed cellular voice channels (VoLTE, VoNR, 3G AMR, carrier VoIP) and acoustic air gaps using IPv4 packet transport for UDP and split-connection PEP transport for TCP. It enables unmodified network applications—specifically **OpenSSH** and **Mosh (Mobile Shell)**—to operate reliably under severe bandwidth, latency, and transcoding constraints.
 
-To eliminate TCP congestion window collapse over high-latency and half-duplex links (such as MCS 0 with multi-second RTOs), V-RADM implements an embedded **Split-Connection Performance Enhancing Proxy (TCP-PEP)** adhering to RFC 3135.
+To eliminate TCP congestion window collapse over high-latency and half-duplex links (such as MCS 0 with multi-second RTOs), V-RADM implements an embedded **Split-Connection Performance Enhancing Proxy (TCP-PEP)** informed by RFC 3135 (Informational).
+
+* **Deployment Topology Operational Hierarchy:**
+  * **Topology C (Primary Field Baseline, iOS 18.2+):** Leverages Apple's "Add Audio in Calls" API to inject synthesized modem PCM directly into an active native cellular voice call (VoLTE/AMR). This provides single-phone, standalone operation for field and backcountry environments without extra hardware or secondary devices.
+  * **Topology B (In-App VoIP Fallback, iOS 17+):** Establishes an in-app SIP/RTP session directly over cellular data to the Asterisk PBX, enabling single-device modem operation on iOS versions prior to 18.2.
+  * **Topology A (Hardware Qualification & Lab Baseline):** Utilizes a wired TRRS dongle interconnecting the primary iPhone to a secondary handset or acoustic test rig. This serves as the reference hardware validation baseline, eliminating ambient acoustic noise, room reverberation, and handset AEC variables during DSP development, and provides an emergency zero-data-coverage failover.
+
 
 ```
  ┌────────────────────────────────────────────────────────────────────────┐
@@ -106,12 +111,12 @@ V-RADM defines two physical layer frame formats: the **Canonical Data Frame (64 
 
 | Byte Range | Field Name | Width | Scope & Operational Description |
 | --- | --- | --- | --- |
-| `0x00..0x01` | `SYNC_WORD` | 16 bits | Fixed frame delimiter: `0xD391`. Used for frame confirmation after PLCP synchronization. |
+| `0x00..0x01` | `SYNC_WORD` | 16 bits | Fixed frame delimiter: `0xD391`. In-band Layer 2 frame alignment and integrity delimiter evaluated *after* $8 \times 8$ block deinterleaving. It is NOT a raw physical serialized leading delimiter on the acoustic channel. |
 | `0x02` | `CTRL` | 8 bits | Bit [7]: Mode (`0` = Standard IP Duplex, `1` = Simplex SOTP Broadcast)<br><br>Bits [6..4]: Active Frame MCS (`000` = MCS 0 .. `100` = MCS 4)<br><br>Bit [3]: TDD Turn Flag (`1` = Yield physical channel to peer / end of burst, `0` = Contiguous burst frame follows)<br><br>Bit [2]: `FRAME_CLASS` (`0` = Reliable Stream, `1` = Best-Effort Datagram)<br><br>Bits [1..0]: Wire Protocol Version (`10` = v3.8) |
 | `0x03` | `SEQ` | 8 bits | Rolling transmit sequence number ($0\text{--}255$).<br>• When `FRAME_CLASS = 0`: Carries `REL_SEQ` ($0\text{--}255$), participating in Selective Repeat ARQ.<br>• When `FRAME_CLASS = 1`: Carries `BE_SEQ` ($0\text{--}255$), used solely for fragment reassembly and deduplication. Does NOT consume `REL_SEQ`. |
 | `0x04` | `ACK_BASE` | 8 bits | Cumulative ACK: highest contiguous peer `REL_SEQ` received in-order. Strictly tracks reliable stream frames (`FRAME_CLASS = 0`). Best-effort frames never advance or stall `ACK_BASE`. |
-| `0x05` | `ACK_MAP` | 8 bits | Bit [7] (MSB): Feedback Type (`0` = Normal Bitmap, `1` = Urgent NACK).<br><br>Bits [6..0]: Selective ACK bitmap for reliable frames `seq_advance(ACK_BASE, 1)` through `seq_advance(ACK_BASE, 7)` (`1` = received/acknowledged, `0` = missing/unacknowledged):<br>• Bit 0 (LSB): `seq_advance(ACK_BASE, 1)`<br>• Bit 1: `seq_advance(ACK_BASE, 2)`<br>• Bit 2: `seq_advance(ACK_BASE, 3)`<br>• Bit 3: `seq_advance(ACK_BASE, 4)`<br>• Bit 4: `seq_advance(ACK_BASE, 5)`<br>• Bit 5: `seq_advance(ACK_BASE, 6)`<br>• Bit 6: `seq_advance(ACK_BASE, 7)`<br>*Best-effort frames (`FRAME_CLASS = 1`) never participate in or stall `ACK_MAP`.* |
-| `0x06` | `PAYLOAD_LEN` | 8 bits | Valid payload bytes $k$, where $0 \le k \le 38$. |
+| `0x05` | `ACK_MAP` | 8 bits | Bit [7] (MSB): Feedback Type (`0` = Normal Bitmap, `1` = Urgent NACK).<br><br>Bits [6..0]: Selective ACK bitmap for reliable frames `seq_advance(ACK_BASE, 1)` through `seq_advance(ACK_BASE, 7)` (`1` = received/acknowledged, `0` = missing/unacknowledged):<br>• Bit 0 (LSB): `seq_advance(ACK_BASE, 1)`<br>• Bit 1: `seq_advance(ACK_BASE, 2)`<br>• Bit 2: `seq_advance(ACK_BASE, 3)`<br>• Bit 3: `seq_advance(ACK_BASE, 4)`<br>• Bit 4: `seq_advance(ACK_BASE, 5)`<br>• Bit 5: `seq_advance(ACK_BASE, 6)`<br>• Bit 6: `seq_advance(ACK_BASE, 7)`<br>*Best-effort frames (`FRAME_CLASS = 1`) never participate in or stall `ACK_MAP`.*<br><br>*ARQ Window Coverage:* Combined with `ACK_BASE` (which is implicitly acknowledged), the 7 selective forward bits cover exactly $W_{\text{ARQ}} = 8$ distinct sequence numbers simultaneously. |
+| `0x06` | `PAYLOAD_LEN` | 8 bits | Valid payload bytes $k$, where $0 \le k \le 38$.<br><br>• **Zero-Length Frames ($k = 0$):** Fully legal at Layer 2 for keepalives and pure ARQ feedback (`ACK_BASE` / `ACK_MAP`). Bytes `0x08..0x2D` are filled with zero padding; `PAYLOAD_CRC16` covers bytes `0x02..0x2D`. The IP reassembly engine ignores $k = 0$ frames (no IP packet slice delivered to TUN).<br>• **Data Frames ($1 \le k \le 38$):** Carries $k$ information bytes starting at Byte `0x08`. Bytes from $0x08 + k$ to $0x2D$ are zero-padded prior to CRC and RS parity computation. |
 | `0x07` | `HEADER_CRC8` | 8 bits | CRC-8 covering bytes `0x02..0x06`. Parameters: Polynomial `0x07` ($x^8 + x^2 + x + 1$), Init `0x00`, RefIn `false`, RefOut `false`, XorOut `0x00`. (Test vector: ASCII `"123456789"` $\implies$ `0xF4`). |
 | `0x08..0x2D` | `PAYLOAD` | 38 bytes | Information payload: 1-byte IP fragmentation header + up to 37 bytes IP data (or 38 bytes SOTP slice). |
 | `0x2E..0x2F` | `PAYLOAD_CRC16` | 16 bits | CRC-16 covering bytes `0x02..0x2D`. Parameters: CRC-16/CCITT-FALSE, Polynomial `0x1021` ($x^{16} + x^{12} + x^5 + 1$), Init `0xFFFF`, RefIn `false`, RefOut `false`, XorOut `0x0000`. (Test vector: ASCII `"123456789"` $\implies$ `0x29B1`). Multi-byte field encoded in Big-Endian. |
@@ -120,6 +125,16 @@ V-RADM defines two physical layer frame formats: the **Canonical Data Frame (64 
 * **Total Protected Information Block:** Bytes `0x00..0x2F` = **48 bytes**.
 * **Total FEC Parity Block:** Bytes `0x30..0x3F` = **16 bytes**.
 * **Total Frame Length:** $48 + 16 = \mathbf{64\text{ bytes}}$ (512 bits).
+
+#### Two-Layer Framing & Interleaving Architecture
+To prevent confusion between logical frame structures and physical serialized symbols:
+1. **Layer 2 (Logical Link Layer) - Canonical Data Frame (64 Bytes):**
+   Comprises the complete systematic $\text{RS}(64, 48)$ codeword $[m_0 \dots m_{47} \mid p_0 \dots p_{15}]$. `SYNC_WORD` (`0xD391`) resides at logical bytes `0x00..0x01` as the first two message bytes ($m_0, m_1$), protected by both the RS code and block interleaving.
+2. **Layer 1 (Physical Framing & Transmission):**
+   The entire 64-byte logical frame is loaded into the $8 \times 8$ byte block interleaver ($\pi(i) = (i \bmod 8) \cdot 8 + \lfloor i/8 \rfloor$) and transmitted as serialized symbols.
+3. **Receiver Synchronization & Demapping:**
+   Raw physical burst synchronization and symbol clock alignment are established at Layer 1 exclusively by the PLCP Barker-13 dual-chirp preamble and the continuous sample-slip DLL (or CP correlator). Once 64 physical channel bytes and soft confidences are gathered, Layer 1 applies the inverse block deinterleaver ($\pi^{-1}$). Layer 2 then evaluates `bytes[0..1] == 0xD391` to confirm post-deinterleave frame alignment prior to RS errors-and-erasures decoding.
+
 
 #### Canonical Modulo-256 Serial Number Arithmetic Primitives
 Because 8-bit sequence numbers (`REL_SEQ`, `BE_SEQ`, `ACK_BASE`) wrap at 256 ($0\text{xFF} \to 0\text{x00}$), integer comparisons (e.g. `$a > b$`) produce invalid results across boundary wraps. All link-layer sequence comparisons, ARQ window evaluations, MCS commit sequence switchovers, and fragment aging strictly mandate RFC 1982 Serial Number Arithmetic defined by the following canonical primitives:
@@ -170,7 +185,7 @@ With an in-flight ARQ window bounded by $W_{\text{ARQ}} \le 8$ frames, any activ
  │ MCS  │ Nature   │ Baud   │ Alphabet  │ Independent │ Bits/Sym │ Raw PHY    │ Max L3   │ PLCP-Adj L3 │ Empirical    │
  │      │          │ (Bd)   │ Size (Y)  │ Dims (Z)    │ (X)      │ Rate (bps) │ Rate(bps)│ Ceiling(bps)│ Planning(bps)│
  ├──────┼──────────┼────────┼───────────┼─────────────┼──────────┼────────────┼──────────┼─────────────┼──────────────┤
- │ 0    │ Feature  │ 20     │ 16        │ 1           │ 4        │ 80.0       │ 46.25    │ 43.56 / 32.3│ ~24.0        │
+ │ 0    │ Feature  │ 20     │ 16        │ 1           │ 4        │ 80.0       │ 46.25    │ 43.56 (Burst) / 32.30 (Single) │ ~24.0        │
  │ 1    │ Feature  │ 50     │ 256       │ 3           │ 8        │ 400.0      │ 231.25   │ 225.04      │ ~155.0       │
  │ 2*   │ Hybrid   │ 100    │ 256       │ 4           │ 8        │ 800.0      │ 455.38   │ 431.92      │ ~330.0       │
  │ 3*   │ Coherent │ 200    │ 65,536    │ 8           │ 16       │ 3,200.0    │ 1,793.94 │ 1,477.69    │ ~920.0       │
@@ -223,11 +238,10 @@ To prevent sample slips across asynchronous clock boundaries (`AVAudioEngine` vs
 
 1. **Analytic Signal Generation & 4th-Power Baseband Chain:** Rather than sacrificing a dedicated subcarrier to an unmodulated pilot tone—which would degrade bit-loading—all subcarriers carry 2-bit DQPSK data throughout the payload ($Z=4$ for MCS 2, $Z=8$ for MCS 3). Carrier and timing tracking relies on **4th-Power Non-Data-Aided (NDA)** processing:
    * **Analytic Bandpass Pre-Filtering:** To prevent unrejected negative-frequency image distortion at $-2f_k$ upon complex downmixing, the received real PCM audio $x[n]$ is converted to an analytic signal centered at subcarrier $k$:
-     $$z_k[n] = \operatorname{BPF}^{\text{analytic}}_k\{x[n]\} = \operatorname{BPF}_k\{x[n]\} + j \cdot \mathcal{H}\{\operatorname{BPF}_k\{x[n]\}\}$$
-     where $\mathcal{H}\{\cdot\}$ is the Hilbert transform (yielding an analytic bandpass signal with $\ge 40\text{ dB}$ image rejection).
-   * **Complex Baseband Downmixing:** The analytic subcarrier is downmixed to complex baseband:
-     $$u_k[n] = z_k[n] \cdot e^{-j \frac{2\pi f_k n}{F_s}}$$
-   * **4th-Power Non-Linearity:** The complex baseband signal is raised to the 4th power:
+     $$z_k[n] = \text{BPF}_k\{x[n]\} = x[n] * h_{\text{analytic}, k}[n] \in \mathbb{C}$$
+   * **Analytic Downmixing:**
+     $$u_k[n] = z_k[n] e^{-j 2\pi f_k n / F_s}$$
+   * **4th-Power PSK Data Stripping:**
      $$q_k[n] = (u_k[n])^4$$
    * **Phase-Error Interpretation & Reference Phase Contribution:** For ideal 4-state phase modulation, the fourth-power operation strips the data constellation ($4 \cdot \Delta \phi_k \equiv 0 \pmod{2\pi}$). However, the transmit reference symbol ($m = 0$) sets initial carrier phases to $\phi_k(0) = \frac{k\pi}{4}$. Raising this to the 4th power contributes a non-zero, carrier-dependent phase:
      $$4 \cdot \phi_k(0) = k\pi \implies e^{j 4\phi_k(0)} = e^{j k\pi} = (-1)^k$$
@@ -287,18 +301,37 @@ $$w(n) = \begin{cases}  \frac{1}{2}\left[1 - \cos\left(\frac{\pi (n + 0.5)}{L}\r
 #### MCS 1: Robust Narrowband Cellular (Feature-Domain Reference Atom Codebook)
 
 * **Alphabet:** $Y = 256$ joint speech-feature states ($8\text{ bits/symbol}$ at $50\text{ Bd}$, $T_{\text{sym}} = 20.0\text{ ms} = 160\text{ samples at } 8\text{ kHz}$).
+* **Bit-to-Symbol Parameter Mapping:**
+  Each 8-bit byte $S \in [0 \dots 255]$ ($S = b_7 b_6 b_5 b_4 b_3 b_2 b_1 b_0$) maps deterministically to the triad of speech atom synthesis parameters:
+  $$\begin{aligned}
+  \text{vowel\_idx} &= (S \gg 5) \& 0\text{x07} && \text{(Bits [7..5], 3 bits, selects Formant pair } 0 \dots 7) \\
+  \text{pitch\_idx} &= (S \gg 2) \& 0\text{x07} && \text{(Bits [4..2], 3 bits, selects Pitch Lag } T_0[0 \dots 7]) \\
+  \text{phase\_idx} &= S \& 0\text{x03}          && \text{(Bits [1..0], 2 bits, selects Phase Offset } \delta \in \{0, 1, 2, 3\}\text{ samples})
+  \end{aligned}$$
+* **Canonical Formant Table ($F_1, F_2$ in Hz, $Q = 5.0$):**
+  - Index 0: $(300, 900)\text{ Hz}$ (`/u/`)
+  - Index 1: $(350, 1400)\text{ Hz}$ (`/o/`)
+  - Index 2: $(450, 1100)\text{ Hz}$ (`/ɔ/`)
+  - Index 3: $(500, 1700)\text{ Hz}$ (`/ə/`)
+  - Index 4: $(600, 1200)\text{ Hz}$ (`/a/`)
+  - Index 5: $(650, 1900)\text{ Hz}$ (`/æ/`)
+  - Index 6: $(750, 1300)\text{ Hz}$ (`/e/`)
+  - Index 7: $(800, 2100)\text{ Hz}$ (`/i/`)
+* **Canonical Pitch Lag Table ($T_0$ in samples at $8\text{ kHz}$):**
+  - Index 0: $T_0 = 33\text{ samples}$ ($F_0 = 242.4\text{ Hz}$)
+  - Index 1: $T_0 = 38\text{ samples}$ ($F_0 = 210.5\text{ Hz}$)
+  - Index 2: $T_0 = 43\text{ samples}$ ($F_0 = 186.0\text{ Hz}$)
+  - Index 3: $T_0 = 49\text{ samples}$ ($F_0 = 163.3\text{ Hz}$)
+  - Index 4: $T_0 = 56\text{ samples}$ ($F_0 = 142.9\text{ Hz}$)
+  - Index 5: $T_0 = 64\text{ samples}$ ($F_0 = 125.0\text{ Hz}$)
+  - Index 6: $T_0 = 72\text{ samples}$ ($F_0 = 111.1\text{ Hz}$)
+  - Index 7: $T_0 = 80\text{ samples}$ ($F_0 = 100.0\text{ Hz}$)
 * **Excitation Pulse Train ($e(n)$):**
 
 $$e(n) = \sum_{p=0}^{\lfloor (159-\delta)/T_0 \rfloor} \delta_{\text{dirac}}[n - (\delta + p \cdot T_0)]$$
 
-* Lag Delay ($T_0$, 3 bits): $T_0 \in \{33, 38, 43, 49, 56, 64, 72, 80\}\text{ samples at } 8\text{ kHz}$ ($F_0 \approx 100.0\text{ to } 242.4\text{ Hz}$).
-* Phase Offset ($\delta$, 2 bits): $\delta \in \{0, 1, 2, 3\}\text{ samples}$. Pulse positions are generated by a periodic pitch excitation pulse train; $\delta$ provides a fractional phase offset relative to the frame origin, emulating the excitation phase of cellular ACELP codebooks without forcing artificial subframe truncation.
-
-* **Formant Filter ($h_{\text{vowel}}(n)$):** Direct-form II cascaded biquad IIR filter ($Q = 5.0$) modeling 8 vowel states:
-
-$$\{(300, 900), (350, 1400), (450, 1100), (500, 1700), (600, 1200), (650, 1900), (750, 1300), (800, 2100)\}\text{ Hz}$$
-
-Digital biquad coefficients for each resonance $F_c$:
+* **Phase Offset ($\delta$, 2 bits):** $\delta = \text{phase\_idx} \in \{0, 1, 2, 3\}\text{ samples}$. Pulse positions are generated by a periodic pitch excitation pulse train; $\delta$ provides a fractional sample phase offset relative to symbol origin, emulating the excitation phase of cellular ACELP codebooks without forcing artificial subframe truncation.
+* **Formant Filter ($h_{\text{vowel}}(n)$):** Direct-form II cascaded biquad IIR filter ($Q = 5.0$) modeling the selected vowel state. Digital biquad coefficients for each resonance $F_c$:
 
 $$\omega_0 = \frac{2\pi F_c}{F_s}, \quad \alpha = \frac{\sin(\omega_0)}{2Q}$$
 
@@ -356,22 +389,27 @@ Transitions occur on 5 ms ACELP subframe boundaries.
 
 $$N_{\text{fft}} = 28\text{ points}, \quad N_{\text{cp}} = 4\text{ points} \implies N_{\text{total}} = 32\text{ samples (4.0 ms, 250 Bd)}$$
 
-For indices $k \in [0..14]$ with complex QPSK data symbols $D_k$:
+To enforce real-valued time-domain samples without index collision at DC ($k=0$) or Nyquist ($k=14$), frequency-domain bins are mapped via Hermitian conjugate symmetry:
 
-$$X[k] = D_k, \quad X[28 - k] = D_k^*, \quad X[0] = X[14] = 0$$
+$$X[k] = D_k, \quad X[28 - k] = D_k^* \quad \text{for } k \in [1 \dots 13], \quad X[0] = X[14] = 0$$
+
+where inactive bins $k \in \{1, 4, 11, 12, 13\}$ are set to zero ($D_k = 0$). The synthesized real time-domain sequence is:
 
 $$x(n) = \frac{1}{\sqrt{N_{\text{fft}}}} \sum_{k=0}^{N_{\text{fft}}-1} X[k] e^{j \frac{2\pi k n}{N_{\text{fft}}}} \in \mathbb{R}$$
 
+* **Telephone-Band Carrier Allocation ($Z = 8$ Active Carriers):**
+
+$$k \in \{2, 3, 5, 6, 7, 8, 9, 10\} \implies f_k \in \{571.4, 857.1, 1428.6, 1714.3, 2000.0, 2285.7, 2571.4, 2857.1\}\text{ Hz}$$
+
+* **Unit-Energy Constellation Mapping:**
+  Data bits are mapped to unit-energy Gray-coded QPSK symbols:
+  $$D_k = \frac{1}{\sqrt{2}} \left( (1 - 2b_0) + j(1 - 2b_1) \right), \quad b_0, b_1 \in \{0, 1\}$$
 * **Sample-Exact Cyclic Prefix Prepending:**
   For each 28-point real IFFT output $x[0 \dots 27]$, the 32-sample transmitted slot is constructed by prepending the final $N_{\text{cp}} = 4$ samples:
   $$x_{\text{slot}}[n] = \begin{cases} x[24 + n], & 0 \le n < 4 \\ x[n - 4], & 4 \le n < 32 \end{cases}$$
   yielding $x_{\text{slot}} = [x[24], x[25], x[26], x[27], x[0], x[1], \dots, x[27]]$.
 * **Framing & Reference Slot Construction:**
-  Each frame comprises 33 OFDM slots ($132.0\text{ ms}$): Slot 0 ($m=0$) is a known differential reference slot ($D_k(0) = 1 + j$); Slots $m = 1 \dots 32$ carry the 512 bits (64 bytes) of protected payload and FEC. The reference slot undergoes identical 28-point IFFT modulation, cyclic prefix prepending, and peak-safe normalization as data slots $m = 1 \dots 32$.
-* **Telephone-Band Carrier Allocation ($Z = 8$ Active Carriers):**
-
-$$k \in \{2, 3, 5, 6, 7, 8, 9, 10\} \implies f_k \in \{571.4, 857.1, 1428.6, 1714.3, 2000.0, 2285.7, 2571.4, 2857.1\}\text{ Hz}$$
-
+  Each frame comprises 33 OFDM slots ($132.0\text{ ms}$): Slot 0 ($m=0$) is a known differential reference slot with $D_k(0) = \frac{1 + j}{\sqrt{2}}$ for all 8 active subcarriers $k \in \{2, 3, 5, 6, 7, 8, 9, 10\}$; Slots $m = 1 \dots 32$ carry the 512 bits (64 bytes) of protected payload and FEC. The reference slot undergoes identical 28-point IFFT modulation, cyclic prefix prepending, and peak-safe normalization as data slots $m = 1 \dots 32$.
 * **Demodulation:** Differential QPSK across consecutive OFDM symbol slots eliminates the requirement for absolute carrier-phase channel estimation under the assumption of sufficiently slow channel variation.
 
 ### 3.3 Output Level Conditioning & Peak-Safe Normalization
@@ -466,8 +504,14 @@ Prior to transmitting user data or adapting modulation rates, endpoints establis
    ```
    * **Byte 0x00:** `MSG_TYPE` (`0xBE` = `SESSION_REQUEST`, `0xBF` = `SESSION_ACCEPT`).
    * **Bytes 0x01..0x10:** `NONCE` (128-bit CSPRNG nonce $R_A$ or $R_B$).
-   * **Bytes 0x11..0x14:** `EPOCH_HINT` (`0x00000000` in request; computed `SESSION_EPOCH` in accept).
-   * **Bytes 0x15..0x1C:** `BOOTSTRAP_MAC` (64-bit truncated SipHash-2-4 computed over bytes `0x00..0x14` using PSK).
+   * **Bytes 0x11..0x14:** `EPOCH_HINT` (Set to `0x00000000` [`RESERVED`] in `SESSION_REQUEST`; carries computed 32-bit `SESSION_EPOCH` in `SESSION_ACCEPT`).
+   * **Bytes 0x15..0x1C:** `BOOTSTRAP_MAC` (64-bit truncated SipHash-2-4 computed using PSK):
+      * **For `SESSION_REQUEST` (`MSG_TYPE = 0xBE`):**
+        $$\text{BOOTSTRAP\_MAC}_{\text{req}} = \text{Trunc64}\Big(\text{SipHash-2-4}_{\text{PSK}}\big(\text{MSG\_TYPE} \,\|\, R_A \,\|\, \text{LE32}(\text{EPOCH\_HINT})\big)\Big)$$
+        (computed over the 21 bytes spanning `0x00..0x14` of the request frame).
+      * **For `SESSION_ACCEPT` (`MSG_TYPE = 0xBF`):**
+        $$\text{BOOTSTRAP\_MAC}_{\text{accept}} = \text{Trunc64}\Big(\text{SipHash-2-4}_{\text{PSK}}\big(R_A \,\|\, \text{MSG\_TYPE} \,\|\, R_B \,\|\, \text{LE32}(\text{EPOCH\_HINT})\big)\Big)$$
+        (computed over 37 bytes, binding the initiator's active nonce $R_A$ to prevent replay or cross-session injection of accept responses; the initiator strictly verifies this tag against its pending $R_A$).
    * **Bytes 0x1D..0x1E:** `BOOTSTRAP_CRC16` (CRC-16/CCITT-FALSE covering bytes `0x00..0x1C`: Poly `0x1021`, Init `0xFFFF`, RefIn `false`, RefOut `false`, XorOut `0x0000`, Big-Endian).
    * **Byte 0x1F:** `RESERVED` (`0x00`).
    * **Modulation & Modulation-Specific RTO:** Modulated via robust 2-FSK at 100 Bd ($256\text{ bits} \times 10.0\text{ ms} = 2.56\text{ s}$ transmission) or MCS 0 ($64\text{ symbols} \times 50.0\text{ ms} = 3.20\text{ s}$ transmission). The handshake retransmission timeout $T_{\text{boot\_rto}}$ accounts for physical transmission time, acoustic reverberation guard ($150\text{ ms}$), receiver processing margin ($500\text{ ms}$), and peer response transmission:
@@ -519,10 +563,10 @@ To prevent unauthorized over-the-air injection of corrupted PLCP commands, accid
   * **Extended Outage Counter Resynchronization (>127-Gap Recovery):** The RFC 3550 nearest-value unwrapping window has an unambiguous range of $\pm 127$ counter advances. If the receiver experiences an extended channel outage or deep fade such that no verified PLCP beacon is decoded for $\Delta c > 127$ counter increments (or outage duration $T_{\text{outage}} > 128 \times T_{\text{beacon}}$), the receiver MUST invalidate its sequence inference state (`c_rx_max = INVALID`), reset the anti-replay bitmap, and require an authenticated session resynchronization via a fresh bootstrap exchange before accepting subsequent PLCP beacons or CCF commands.
 * **`BEACON_MAC8` & `CCF_MAC` Wire Formulations:**
   * **`BEACON_MAC8`:** An 8-bit truncated **SipHash-2-4** MAC computed over the candidate 16-bit counter $\widehat{c}$ and beacon payload using $K_{\text{CTRL\_MAC}}$:
-    $$\text{BEACON\_MAC8} = \text{Trunc8}\Big(\text{SipHash-2-4}_{K_{\text{CTRL\_MAC}}}\big(\text{SESSION\_EPOCH} \,\|\, \widehat{c} \,\|\, \text{CUR\_MCS} \,\|\, \text{REQ\_MCS} \,\|\, \text{TX\_PWR} \,\|\, \text{BEAC\_SEQ}\big)\Big)$$
+    $$\text{BEACON\_MAC8} = \text{Trunc8}\Big(\text{SipHash-2-4}_{K_{\text{CTRL\_MAC}}}\big(\text{LE32}(\text{SESSION\_EPOCH}) \,\|\, \text{LE16}(\widehat{c}) \,\|\, \text{CUR\_MCS} \,\|\, \text{REQ\_MCS} \,\|\, \text{TX\_PWR} \,\|\, \text{BEAC\_SEQ}\big)\Big)$$
   * **`CCF_MAC` (16-bit Monotonic Anti-Replay Closure):** An 8-bit truncated **SipHash-2-4** MAC computed strictly over wire and session fields, binding the full 16-bit inferred control sequence $\widehat{c}_{\text{req}}$ of the burst being acknowledged:
-    $$\text{CCF\_MAC} = \text{Trunc8}\Big(\text{SipHash-2-4}_{K_{\text{CTRL\_MAC}}}\big(\text{SESSION\_EPOCH} \,\|\, \text{LE16}(\widehat{c}_{\text{req}}) \,\|\, \text{CCF\_CTRL} \,\|\, \text{ACK\_BASE} \,\|\, \text{ACK\_MAP} \,\|\, \text{CCF\_CRC16}\big)\Big)$$
-    *Because $\widehat{c}_{\text{req}} \in [0 \dots 59,999]$ is the full 16-bit inferred control counter rather than the 8-bit truncated `BEAC_SEQ`, the 32-byte MAC preimage is cryptographically unique across the entire 60,000-beacon lifetime of the session epoch. When Node A receives a CCF, it verifies that $\widehat{c}_{\text{req}}$ matches its locally recorded transmit counter for that burst ($c_{\text{tx\_last}}$). Stale CCFs from earlier turns—even if sharing the same `ACK_BASE` or 8-bit `BEAC_SEQ` wrap—produce mismatched MAC tags and are discarded before state machine processing. However, because the truncated tag length is 8 bits ($2^8 = 256$ states), `CCF_MAC` operates strictly as a lightweight authenticated integrity filter against accidental channel corruption, stale turn replays, and casual blind injection; it does NOT provide cryptographic work-factor security against an active adversary repeatedly guessing tags over the air. Application data confidentiality and cryptographically strong authentication remain anchored in SSH-2 and Mosh.*
+    $$\text{CCF\_MAC} = \text{Trunc8}\Big(\text{SipHash-2-4}_{K_{\text{CTRL\_MAC}}}\big(\text{LE32}(\text{SESSION\_EPOCH}) \,\|\, \text{LE16}(\widehat{c}_{\text{req}}) \,\|\, \text{CCF\_CTRL} \,\|\, \text{ACK\_BASE} \,\|\, \text{ACK\_MAP} \,\|\, \text{CCF\_CRC16}\big)\Big)$$
+    *Because $\widehat{c}_{\text{req}} \in [0 \dots 59,999]$ is the full 16-bit inferred control counter rather than the 8-bit truncated `BEAC_SEQ`, the 11-byte MAC preimage ($4 + 2 + 1 + 1 + 1 + 2 = 11\text{ B}$) is cryptographically unique across the entire 60,000-beacon lifetime of the session epoch. When Node A receives a CCF, it verifies that $\widehat{c}_{\text{req}}$ matches its locally recorded transmit counter for that burst ($c_{\text{tx\_last}}$). Stale CCFs from earlier turns—even if sharing the same `ACK_BASE` or 8-bit `BEAC_SEQ` wrap—produce mismatched MAC tags and are discarded before state machine processing. However, because the truncated tag length is 8 bits ($2^8 = 256$ states), `CCF_MAC` operates strictly as a lightweight authenticated integrity filter against accidental channel corruption, stale turn replays, and casual blind injection; it does NOT provide cryptographic work-factor security against an active adversary repeatedly guessing tags over the air. Application data confidentiality and cryptographically strong authentication remain anchored in SSH-2 and Mosh.*
   * **Single-Outstanding-Request Invariant:** At most one authenticated control transaction requiring a CCF response (e.g., MCS commit handshake or TDD turn handover) may be outstanding per direction at any given time. A new control transaction cannot be initiated until the active transaction has been committed, rejected, or timed out ($T_{\text{RTO}}$). Because $\widehat{c}_{\text{req}}$ is inferred by the receiver from the active transaction context rather than transported explicitly in the CCF wire format, this invariant guarantees that arriving CCFs map deterministically and unambiguously to exactly one transaction context, preventing race conditions between overlapping requests.
   * **CCF Semantic Idempotency & Duplicate Suppression:** For each inferred monotonic request counter $\widehat{c}_{\text{req}}$, each command class (e.g. `TDD_YIELD`, `MCS_COMMIT_ACK`, `TDD_GRANT`) has exactly one accepted semantic state transition. Subsequent authenticated duplicate CCF frames matching the active $\widehat{c}_{\text{req}}$ are processed as link-level retransmissions to update ARQ acknowledgment bitmaps, but MUST NOT trigger repeated state-machine transitions (e.g., granting channel ownership multiple times or executing redundant MCS step-downs).
 
@@ -546,7 +590,21 @@ To prevent unauthorized over-the-air injection of corrupted PLCP commands, accid
 * `PLCP_PREAMBLE`: 13 chips $\times 5.0\text{ ms} = \mathbf{65.0\text{ ms}}$ (520 samples at $8\text{ kHz}$).
 * `PLCP_GUARD`: $10.0\text{ ms}$ silence (80 zero samples) before and after header.
 * `PLCP_HEADER_PAYLOAD`: 16 bits (`CUR_MCS` [3b], `REQ_MCS` [3b], `TX_PWR` [2b], `BEAC_SEQ` [8b]) + 8-bit `BEACON_MAC8` = **24 information bits**.
-* `PLCP_HEADER_FEC`: Two independent Extended Golay $[24, 12, 8]$ codewords (Codeword 1: Bits 0..11; Codeword 2: Bits 12..23). Total encoded header = **48 bits**.
+* `PLCP_HEADER_FEC` & Bit-Exact Codeword Partitioning:
+  The 24 information bits are partitioned into two 12-bit words ($m^{(1)}, m^{(2)}$), each independently encoded by the systematic Extended Golay $[24, 12, 8]$ codec into 24-bit codewords ($c^{(1)}, c^{(2)}$):
+  * **Codeword 1 ($m^{(1)} \in [0 \dots 4095]$, 12 bits):**
+    - Bits [11..9] (MSB): `CUR_MCS` (3 bits, values `000` through `100`).
+    - Bits [8..6]: `REQ_MCS` (3 bits, values `000` through `100`).
+    - Bits [5..4]: `TX_PWR` (2 bits, `00` = 0 dB, `01` = -3 dB, `10` = -6 dB, `11` = -9 dB).
+    - Bits [3..0] (LSB): `BEAC_SEQ[7..4]` (High nibble of beacon counter, 4 bits).
+    $$m^{(1)} = (\text{CUR\_MCS} \ll 9) \mid (\text{REQ\_MCS} \ll 6) \mid (\text{TX\_PWR} \ll 4) \mid ((\text{BEAC\_SEQ} \gg 4) \& 0\text{x0F})$$
+    yielding 24-bit encoded codeword $c^{(1)} = (m^{(1)} \ll 12) \mid (m^{(1)} \cdot P_{12} \pmod 2)$.
+  * **Codeword 2 ($m^{(2)} \in [0 \dots 4095]$, 12 bits):**
+    - Bits [11..8] (MSB): `BEAC_SEQ[3..0]` (Low nibble of beacon counter, 4 bits).
+    - Bits [7..0] (LSB): `BEACON_MAC8` (Complete 8-bit SipHash-2-4 MAC, preserved intact without boundary splitting).
+    $$m^{(2)} = ((\text{BEAC\_SEQ} \& 0\text{x0F}) \ll 8) \mid \text{BEACON\_MAC8}$$
+    yielding 24-bit encoded codeword $c^{(2)} = (m^{(2)} \ll 12) \mid (m^{(2)} \cdot P_{12} \pmod 2)$.
+  * **Serialized Transmission:** Codeword 1 ($c^{(1)}$, 24 bits, MSB first) is serialized immediately followed by Codeword 2 ($c^{(2)}$, 24 bits, MSB first), forming the complete 48-bit header payload.
 * `PLCP_MODULATION`: 2-FSK ($1200\text{ Hz} = \text{Mark}, 1600\text{ Hz} = \text{Space}$) at $100\text{ Bd}$ ($10.0\text{ ms/bit}$). Total header duration = $48 \times 10.0\text{ ms} = \mathbf{480.0\text{ ms}}$.
 * `PLCP_TOTAL_DURATION`: $65.0 + 10.0 + 480.0 + 10.0 = \mathbf{565.0\text{ ms}}$.
 * **Cadence:** PLCP is transmitted at `SESSION_START`, `TDD_DATA_TURN`, `CONTINUOUS_SYNC` (every 16 frames), and `MCS_CHANGE`. *Compact Control Frames (CCFs) do NOT require a PLCP beacon.*
@@ -567,6 +625,10 @@ Each 5.0 ms chip ($N_{\text{chip}} = 40\text{ samples}$ at $F_s = 8\text{ kHz}$)
 * **Synthesized Chip Sample:**
   $$s_{\text{preamble}}[40k + m] = B[k] \cdot w_{\text{taper}}[m] \cdot \begin{cases} c_{\text{up}}(m) & 0 \le m < 20 \\ c_{\text{down}}(m-20) & 20 \le m < 40 \end{cases}$$
   where $w_{\text{taper}}[m]$ applies a 2-sample raised-cosine taper at chip edges ($m \in \{0, 1, 38, 39\}$) to ensure phase and amplitude envelope continuity. The dual-chirp structure provides matched-filter Doppler immunity and precise sub-sample correlation peak resolution.
+* **Sampled Waveform Step Limits:**
+  Across the complete 520-sample synthesized Barker preamble waveform:
+  1. Intra-chip continuous sample step: $|s_{\text{preamble}}[n] - s_{\text{preamble}}[n-1]| \le 1.20$ for all $n \in [1 \dots 519]$ (nominal maximum discrete sample step is $\approx 1.167$).
+  2. Inter-chip boundary transition step: $|s_{\text{preamble}}[40k] - s_{\text{preamble}}[40k-1]| \le 0.30$ for all chip boundaries $k \in [1 \dots 12]$ (including adjacent Barker chips with opposite sign polarity, where the 2-sample raised-cosine edge taper strictly limits boundary transitions to $\le 0.276$).
 
 #### Extended Golay $[24, 12, 8]$ Canonical Parity Matrix & Codec Parameters
 The PLCP header FEC uses the systematic Extended Binary Golay $[24, 12, 8]$ code with generator matrix $G = [I_{12} \mid P_{12}]$, encoding 12 information bits $m = [m_{11} \dots m_0]$ into 24 codeword bits $c = [m \mid p]$ where $p = m \cdot P_{12} \pmod 2$.
@@ -595,6 +657,9 @@ Row 11: 0xFFE -> [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
      $$A_0 = 1, \quad A_8 = 759, \quad A_{12} = 2576, \quad A_{16} = 759, \quad A_{24} = 1$$
      Every codeword has Hamming weight divisible by 4 (doubly-even code).
   4. **Error Correction Capability:** Corrects up to 3 arbitrary bit errors per 24-bit codeword ($t = 3$). Codewords with $\ge 4$ bit errors are flagged as uncorrectable physical erasures.
+  5. **Standard Test Vectors:**
+     * **Encoding Test Vector:** Information word $m = \text{0x5A5}$ ($[0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1]$ where bit 11 is MSB `0` and bit 0 is LSB `1`) generates parity $p = m \cdot P_{12} = \text{0x1D9}$ ($[0, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1]$), producing 24-bit codeword $c = (m \ll 12) \mid p = \mathbf{\text{0x5A51D9}}$ with exact Hamming weight 12.
+     * **Error Correction Verification Vector:** Corrupting $c$ with 3 bit errors via bitwise XOR mask $\text{0xA00040}$ ($c \oplus \text{0xA00040} = \mathbf{\text{0xFA5199}}$) produces a received vector that decodes uniquely back to information word $\mathbf{\text{0x5A5}}$ at minimum Hamming distance 3.
 
 
 ### 4.3 Two-Phase MCS Commit Handshake & Lost ACK Recovery
@@ -635,9 +700,9 @@ Row 11: 0xFFE -> [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
 
 ---
 
-## 5. Half-Duplex TDD Protocol Specification (MCS 0)
+## 5. Half-Duplex Time-Division Duplexing (TDD Protocol)
 
-In open-air acoustic conditions, simultaneous bidirectional audio triggers phone-level Acoustic Echo Cancellation (AEC), destroying the link. MCS 0 enforces deterministic Time Division Duplexing (TDD).
+In free-air acoustic speakerphone environments (`RTO_PROFILE = 2`), simultaneous bidirectional audio triggers handset Acoustic Echo Cancellation (AEC) and non-linear speech ducking, corrupting or canceling demodulator inputs. Therefore, **TDD turn-taking applies to any modulation mode (including MCS 0 and MCS 1) whenever operating over half-duplex acoustic paths**. When deployed over full-duplex cabled dongles or digital PBX channels (`RTO_PROFILE = 1`), TDD is disabled and nodes operate in continuous full duplex.
 
 ```
  0s                  0.565s                 6.965s  7.115s      7.265s                 8.865s  9.015s     9.165s
@@ -648,6 +713,9 @@ In open-air acoustic conditions, simultaneous bidirectional audio triggers phone
   ◄────────────── Node A Transmit Turn ────────────► ◄─ Guard ─► ◄── Node B Turn ─────► ◄─ Guard ─►
 
 ```
+
+* **Acoustic Channel Turn Guard ($150\text{ ms}$):** Accommodates physical room reverberation, acoustic decay, and transceiver audio buffer flush before reversing direction.
+* **EOT Dual-Tone Burst:** The $150.0\text{ ms}$ dual-tone burst ($1400\text{ Hz} + 1800\text{ Hz}$ at $-12.0\text{ dBFS}$) signals channel yield. Placing both frequencies within the telephone passband ($300\text{--}3400\text{ Hz}$) with high SNR ensures robust detection post-vocoder while preventing AEC from categorizing the burst as continuous echo.
 
 ### 5.1 Deterministic TDD Ownership & Burst Pipelining State Machine
 
@@ -736,15 +804,18 @@ Where $d = \min_q \vert{}\text{wrap}(\Delta \phi - \phi_q)\vert{}$ measures angu
 
 $$C_i = \frac{\Lambda(\hat{S}) - \Lambda(S_{\text{second}})}{\Lambda(\hat{S})}$$
 
+Where $\hat{S}$ is the highest-likelihood candidate speech atom and $S_{\text{second}}$ is the runner-up candidate. For MCS 1, $\Lambda(S)$ is the peak normalized cross-correlation between the received 20.0 ms audio segment $r[n]$ ($N_{\text{sym}} = 160$ samples) and the prototype synthesized speech atom $s_S[n]$:
 
+$$\Lambda(S) = \max_{\tau \in [0 \dots 3]} \frac{\sum_{n=0}^{N_{\text{sym}}-1} r[n] \cdot s_S[n - \tau]}{\sqrt{\sum_{n=0}^{N_{\text{sym}}-1} r[n]^2 \sum_{n=0}^{N_{\text{sym}}-1} s_S[n - \tau]^2}}$$
 
-Where $\Lambda(S)$ is the normalized correlation peak or filter magnitude of candidate speech atom $S$.
-* **Byte Confidence:** $C_{\text{byte}} = \min(C_{\text{symbols\_in\_byte}})$. Bytes with $C_{\text{byte}} < \Theta_{\text{erase}} = 0.35$ are flagged as erasures.
+* **Byte Confidence & Erasure Tagging Threshold ($\Theta_{\text{erase}}$):** $C_{\text{byte}} = \min(C_{\text{symbols\_in\_byte}})$. Bytes with $C_{\text{byte}} < \Theta_{\text{erase}} = 0.35$ are flagged as trial erasures for the GMD decoder. Threshold $\Theta_{\text{erase}} = 0.35$ provides an optimal operating point across 3GPP AMR error profiles: higher values trigger excessive trial erasures ($>16$), while lower values permit undetected symbol errors to consume twice the RS correction budget ($2s$).
 
 ### 6.1.1 $8 \times 8$ Byte Block Interleaver & Deinterleaver
 
 To protect against time-localized speech coder transients, pitch pulse distortions, and frame boundary erasures, every 64-byte Canonical Data Frame is processed through a block interleaver that permutes bytes and their corresponding soft confidence values $C_{\text{byte}}$ simultaneously:
 
+* **Two-Layer Framing & Interleaving Separation:**
+  The $8 \times 8$ byte block interleaver operates strictly at Layer 1. The input to the interleaver is the full 64-byte Logical Canonical Frame $[D \mid P]$ constructed at Layer 2 (bytes $0 \dots 47$ containing `SYNC_WORD`, headers, data payload, and `PAYLOAD_CRC16`, followed by bytes $48 \dots 63$ containing the 16 bytes of RS parity). On transmission, the entire 64-byte block is permuted by $\pi(i)$ before physical symbol modulation. On reception, the demodulator gathers the 64 bytes, applies deinterleaver permutation $\pi^{-1} \equiv \pi$, and hands the reassembled 64-byte frame to Layer 2, where `SYNC_WORD` (`0xD391`) is validated as an in-band frame integrity delimiter. Raw physical burst acquisition is handled independently by the PLCP Barker-13 dual-chirp sequence and the 4th-power DLL.
 * **Block Dimensions:** $8 \text{ rows} \times 8 \text{ columns} = 64 \text{ bytes}$ (indices $0 \dots 63$).
 * **Interleaver Permutation (Transmitter):** Bytes are loaded into the $8 \times 8$ matrix in row-major order and extracted in column-major order:
   $$\pi(i) = (i \bmod 8) \cdot 8 + \left\lfloor \frac{i}{8} \right\rfloor, \quad \text{for } i \in [0 \dots 63]$$
@@ -760,22 +831,34 @@ V-RADM employs two systematic Reed-Solomon codes defined over the Galois field $
 1. **Galois Field Definition ($\text{GF}(2^8)$):**
    * Primitive polynomial: $p(x) = x^8 + x^4 + x^3 + x^2 + 1$ ($0x11D = 285$ decimal).
    * Primitive root / field generator: $\alpha = 0x02$ ($\alpha \in \text{GF}(2^8)$ where $\alpha^8 = \alpha^4 + \alpha^3 + \alpha^2 + 1$).
+   * Polynomial Representation & Remainder Ordering: Polynomial coefficients are ordered from highest degree to lowest degree ($g_{2t} x^{2t} + g_{2t-1} x^{2t-1} + \dots + g_0$). When computing systematic parity via polynomial division $m(x) \cdot x^{2t} \pmod{g(x)}$, the resulting remainder polynomial $r(x) = p_0 x^{2t-1} + p_1 x^{2t-2} + \dots + p_{2t-1}$ appends parity bytes in descending degree order ($p_0 \dots p_{2t-1}$).
 2. **Canonical Data Frame Code ($\text{RS}(64, 48)$):**
    * Block length: $N = 64$ bytes; Message length: $K = 48$ bytes; Parity length: $2t = 16$ bytes (error correction capability $t = 8$ bytes).
    * Generator polynomial: $g(x) = \prod_{i=0}^{15} (x - \alpha^i)$ (first root $b = 0$, roots $\alpha^0, \alpha^1, \dots, \alpha^{15}$).
+   * Generator Polynomial Coefficients (descending powers $x^{16} \dots x^0$, hex):
+     `0x01, 0x3B, 0x0D, 0x68, 0xBD, 0x44, 0xD1, 0x1E, 0x08, 0xA3, 0x41, 0x29, 0xE5, 0x62, 0x32, 0x24, 0x3B`
    * Systematic Codeword Layout: 48 information bytes ($m_0 \dots m_{47}$, spanning `SYNC_WORD` through `PAYLOAD_CRC16`) followed by 16 parity bytes ($p_0 \dots p_{15}$).
-   * Generalized Minimum Distance (GMD) Errors-and-Erasures Decoding: Solves $2t + e \le 16$. Bytes with deinterleaved confidence $C_{\text{byte}} < 0.35$ are flagged as trial erasures, testing $e \in \{16, 14, 12, \dots, 0\}$ until a valid codeword matching `PAYLOAD_CRC16` is found.
+   * Generalized Minimum Distance (GMD) Errors-and-Erasures Decoding: Solves $2s + e \le 16$, where $s \le 8$ is corrected symbol errors and $e \le 16$ is tagged erasures. Bytes with deinterleaved confidence $C_{\text{byte}} < 0.35$ are flagged as trial erasures, testing $e \in \{16, 14, 12, \dots, 0\}$ until a valid codeword matching `PAYLOAD_CRC16` is found.
+   * **Standard Test Vector:**
+     * Information bytes (48 bytes): `56 52 41 44 4D 5F 54 45 53 54 5F 46 52 41 4D 45 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F` (ASCII `"VRADM_TEST_FRAME"` followed by `0x00..0x1F`).
+     * Parity bytes (16 bytes): `97 65 00 FE 8D 05 17 4F 63 7C FE 74 32 AF 3D EE`.
+     * Codeword (64 bytes): Information bytes followed by parity bytes; syndromes evaluate to zero across all 16 roots $\alpha^0 \dots \alpha^{15}$.
 3. **Compact Control Frame Code ($\text{RS}(16, 8)$):**
    * Block length: $N = 16$ bytes; Message length: $K = 8$ bytes; Parity length: $2t = 8$ bytes (error correction capability $t = 4$ bytes).
    * Generator polynomial: $g(x) = \prod_{i=0}^{7} (x - \alpha^i)$ (roots $\alpha^0 \dots \alpha^7$).
+   * Generator Polynomial Coefficients (descending powers $x^8 \dots x^0$, hex):
+     `0x01, 0xFF, 0x0B, 0x51, 0x36, 0xEF, 0xAD, 0xC8, 0x18`
    * Systematic Codeword Layout: 8 information bytes ($m_0 \dots m_7$, spanning `SYNC_WORD` through `CCF_MAC`) followed by 8 parity bytes ($p_0 \dots p_7$).
-
+   * **Standard Test Vector:**
+     * Information bytes (8 bytes): `D3 91 01 0A 00 29 B1 4F`.
+     * Parity bytes (8 bytes): `EF 1D 1F 6C 64 B6 63 AE`.
+     * Codeword (16 bytes): Information bytes followed by parity bytes; syndromes evaluate to zero across all 8 roots $\alpha^0 \dots \alpha^7$.
 
 Decoder stress is normalized via the decoder burden metric $B \in [0.0, 1.0]$:
 
-$$B = \frac{2t + e}{16}$$
+$$B = \begin{cases} \frac{2s + e}{16}, & \text{if decoding succeeds } (2s + e \le 16) \\ 1.0, & \text{if decoding fails } (2s + e > 16) \end{cases}$$
 
-The Link Quality Metric $M$ is mathematically bounded in $[0.0, 1.0]$:
+where $s \le 8$ is the number of corrected symbol errors and $e \le 16$ is the number of tagged erasures. When decoding fails, $P_{\text{FER}} = 1.0$ and $B = 1.0$. This strictly bounds $B \in [0.0, 1.0]$ and guarantees the Link Quality Metric $M \in [0.0, 1.0]$:
 
 $$M = 0.4 \cdot \bar{C}_{\text{sym}} + 0.3 \cdot (1.0 - P_{\text{FER}}) + 0.3 \cdot (1.0 - B)$$
 
@@ -846,8 +929,8 @@ To ensure reliable, deterministic operation across high-latency, asymmetric acou
 
 1. **Local Three-Way Handshake Termination (Fast SYN/ACK Spoofing):**
    * Upon intercepting an outbound TCP SYN packet from the local client (`OpenSSH`), the client-side PEP immediately generates a synthetic `SYN+ACK` segment (with zero synthetic RTT, negotiating an RFC 6528 / RFC 9293 cryptographically pseudo-random Initial Sequence Number: $\text{ISN} \leftarrow \text{CSPRNG}(32)$).
-   * **TCP Option Stripping:** The PEP forces clean baseline negotiation by stripping `WSCALE` (Window Scale, RFC 7323), `TSopt` (TCP Timestamps, RFC 7323), and `SACK-Permitted` (RFC 2018) from both client and server SYN packets.
-   * **MSS Clamping:** The Maximum Segment Size (MSS) option is clamped to **216 bytes** ($\text{MTU}_{256} - 40\text{ bytes}$ for IPv4/TCP headers), guaranteeing that generated TCP segments fit within a single 7-fragment burst without secondary fragmentation.
+    * **TCP Option Stripping:** The PEP forces clean baseline negotiation by stripping `WSCALE` (Window Scale, RFC 7323), `TSopt` (TCP Timestamps, RFC 7323), and `SACK-Permitted` (RFC 2018) from both client and server SYN packets. *Note on SACK Stripping Intent:* Stripping `SACK-Permitted` on both local loopback sockets is intentional: because the local loopback path (`utun` to OpenSSH, and `vradmd` to `sshd`) has negligible latency ($<1\text{ ms}$) and zero channel packet loss, TCP selective acknowledgments are superfluous; stripping SACK minimizes TCP header overhead and ensures deterministic sequence tracking.
+    * **MSS Clamping:** The Maximum Segment Size (MSS) option is clamped to **216 bytes** ($\text{MTU}_{256} - 40\text{ bytes}$ for IPv4/TCP headers), guaranteeing that generated TCP segments fit within a single 7-fragment burst without secondary fragmentation.
 2. **Transparent FIN Propagation & Half-Closed State:**
    * When an endpoint initiates graceful connection teardown via `close()` or `shutdown(SHUT_WR)`, emitting a TCP FIN segment:
      * The local PEP acknowledges all pending data up to the FIN sequence number.
@@ -877,7 +960,10 @@ To ensure reliable, deterministic operation across high-latency, asymmetric acou
 
 ```
 
-* **Packet Identity:** $\text{PKT\_ID} \equiv \text{SEQ}_{\text{initial}}$ (8 bits, modulo 256).
+* **Packet Identity:** $\text{PKT\_ID} \equiv (\text{FRAME\_CLASS}, \text{SEQ}_{\text{initial}})$ (8 bits, modulo 256).
+  * For reliable streams (`BEST_EFFORT = 0`), `PKT_ID` is the `REL_SEQ` assigned to Fragment 0 (`FRAG_IDX = 0`).
+  * For best-effort datagrams (`BEST_EFFORT = 1`), `PKT_ID` is the `BE_SEQ` assigned to Fragment 0.
+  * Because reliable and best-effort streams consume independent sequence counters, reassembly contexts are isolated by the tuple `(FRAME_CLASS, PKT_ID)`, preventing sequence collision between SSH and Mosh traffic.
 * `URGENT_FLUSH` (Bit [7]): `1` = High-priority / out-of-band interactive flush (e.g., SSH break / Ctrl-C / SIGINT), instructing the receiving PEP to immediately flush intermediate reassembly buffers and deliver data to the local socket; `0` = Standard stream fragment.
 * `FRAG_IDX` (Bits [6..4]): Fragment index ($0\text{--}7$, 3 bits, matching the 8-fragment maximum).
 * `TOTAL_FRAGS_MINUS_ONE` (Bits [3..1]): Total fragments minus one ($0\text{--}7$, 3 bits, supporting up to 8 fragments $\implies 296\text{ bytes}$ max datagram).
@@ -886,10 +972,13 @@ To ensure reliable, deterministic operation across high-latency, asymmetric acou
   * Reliable fragments consume `REL_SEQ` and are protected by Selective Repeat ARQ.
 * **Virtual MTU:** Standardized at **256 bytes** ($\lceil 256 / 37 \rceil = 7\text{ frames}$ per packet).
 * **Fragment Reassembly Context Lifetime Bounds:**
-  Because `PKT_ID` wraps every 256 frames (which corresponds to $33.8\text{ seconds}$ of transmission at MCS 4), reassembly contexts enforce strict lifetime bounds to prevent stale fragments from colliding with new packets:
-  1. **Temporal Expiration:** Reassembly contexts expire after $T_{\text{reassembly\_timeout}} = \min(2 \times \text{RTO}, 10.0\text{ s})$ of inactivity.
+  Because `PKT_ID` wraps every 256 frames, reassembly contexts enforce strict lifetime bounds to prevent stale fragments from colliding with new packets:
+  1. **Adaptive Temporal Expiration:** Rather than a static 10-second timeout—which at MCS 0 ($T_{\text{turn}} = 9.165\text{ s}$ per frame in half-duplex interactive mode) would prematurely expire 7-fragment packets requiring $7 \times 9.165 = 64.155\text{ seconds}$—the reassembly timeout dynamically adapts to the active modulation ladder:
+     $$T_{\text{reassembly\_timeout}} = \max\left(2 \times \text{RTO}, \; N_{\text{frags\_max}} \times T_{\text{turn}}(\text{active\_MCS}) + 15.0\text{ s}\right)$$
+     For MCS 0 ($N_{\text{frags\_max}} = 8$, $T_{\text{turn}} = 9.165\text{ s}$), $T_{\text{reassembly\_timeout}} = \mathbf{90.0\text{ seconds}}$ ($8 \times 9.165\text{ s} + 15.0\text{ s} = 88.32\text{ s} \approx 90\text{ s}$), accommodating interactive single-frame turns with margin for up to 2 ARQ retransmissions. For high-speed modes (MCS 3 and MCS 4), $T_{\text{reassembly\_timeout}} \approx 16.0\text{--}20.0\text{ seconds}$.
   2. **Sequence Distance Expiration:** If the link sequence space advances by more than 64 frames beyond the initial fragment ($\operatorname{seq\_diff}(\text{current\_seq}, \text{PKT\_ID}) > 64$), the incomplete reassembly context MUST be immediately purged and discarded.
-  3. Because $64 \ll 128$ and $10.0\text{ s} \ll 33.8\text{ s}$ (at MCS 4, 64 frames $\approx 8.45\text{ s}$), any fragment from a prior packet context is guaranteed to be purged long before an 8-bit wrap can induce identifier ambiguity.
+  3. **Wrap Collision Immunity & ARQ Window Invariance:** Across all modes, $T_{\text{reassembly\_timeout}}$ and the 64-frame sequence window strictly prevent 8-bit sequence wrap ambiguity. At MCS 0, a 256-frame wrap takes $256 \times 3.20\text{ s} = 819.2\text{ seconds} \gg 90.0\text{ s}$ (and 64 frames take $204.8\text{ s} > 90.0\text{ s}$). At MCS 4, a 256-frame wrap takes $33.8\text{ seconds}$, but 64 frames correspond to $8.45\text{ seconds}$.
+      * *Mathematical Proof of Zero Premature Purge under Heavy ARQ:* Because the link-layer transmitter is strictly bounded by the selective repeat window ($W_{\text{ARQ}} \le 8\text{ frames} = 296\text{ bytes}$), the transmitter CANNOT advance `current_seq` more than 8 frames beyond the oldest unacknowledged sequence (`ACK_BASE`). For any active packet `PKT_ID` spanning up to $N_{\text{frags\_max}} \le 8$ frames, while any fragment of `PKT_ID` remains unacknowledged, $\text{ACK\_BASE} \le \text{PKT\_ID} + (N_{\text{frags\_max}} - 1) \le \text{PKT\_ID} + 7$. Consequently, while fragments of packet `PKT_ID` are undergoing active transmission or ARQ retransmission, $\operatorname{seq\_diff}(\text{current\_seq}, \text{PKT\_ID}) \le (N_{\text{frags\_max}} - 1) + W_{\text{ARQ}} \le 7 + 8 = 15 \ll 64$ is an immutable invariant. The 64-frame purge threshold can only be triggered after the link layer has completely abandoned the packet and successfully advanced past at least 8 subsequent, complete packet lifecycles. Premature purge during active ARQ recovery is mathematically impossible.
 
 
 ### 7.3 Split-Tunnel Network Profile
@@ -1019,14 +1108,23 @@ AudioSocket Client TCP:9099 ──> Thread Worker ──> vradm_create() ──>
 exten => 774,1,NoOp(Incoming V-RADM Carrier Link)
 same  => n,Answer()
 same  => n,GotoIf($["${CALLERID(num)}" != "+15550198372"]?reject)
-; Hand off 8kHz linear PCM to vradmd TCP daemon (uuid,service) using dynamic RFC 4122 UUID
-same  => n,Set(SOCKET_UUID=${UUID()})
+; Hand off 8kHz linear PCM to vradmd TCP daemon (uuid,service) using dynamic RFC 4122 UUID.
+; Note: ${UUID()} requires Asterisk func_uuid (built via menuselect under Dialplan Functions).
+; If func_uuid is not built, fall back to ${CHANNEL(uniqueid)}:
+same  => n,Set(SOCKET_UUID=${IF($[${ISNULL(${UUID()})}]?${CHANNEL(uniqueid)}:${UUID()})})
 same  => n,AudioSocket(${SOCKET_UUID},127.0.0.1:9099)
 same  => n,Hangup()
 same  => n(reject),NoOp(Unauthorized Call Dropped)
 same  => n,Hangup()
 
 ```
+
+* **AudioSocket Protocol & Session UUID Dispatch:**
+  Upon establishing the TCP connection to `127.0.0.1:9099`, the Asterisk AudioSocket application immediately transmits an initial identification packet:
+  ```text
+  [0x01 (Type: UUID), 0x00, 0x10 (16-byte payload), <16-byte RFC 4122 binary UUID>]
+  ```
+  The `vradmd` worker thread consumes this message, extracts the binary UUID to index its active session table, allocates a dedicated `vradm_engine_t` instance, and begins bi-directional streaming of 8 kHz 16-bit signed linear PCM audio chunks (`[0x10 (Audio Data), len_hi, len_lo, <PCM samples>]`).
 
 ### 9.3 iOS Cross-Process IPC Architecture (Lock-Free SPSC Shared Memory)
 
@@ -1059,8 +1157,15 @@ The iOS architecture strictly separates the untrusted network packet processing 
 
 5. **iOS Background Execution & Lifecycle Constraints:**
    * **`UIBackgroundModes`:** The Main App `Info.plist` declares `UIBackgroundModes` containing `audio` (`<string>audio</string>`).
-   * **Audio Session Configuration:** The app initializes `AVAudioSession.sharedInstance()` with category `.playAndRecord`, mode `.measurement`, and options `[.allowBluetooth, .mixWithOthers]`. Mode `.measurement` requests the least-processed audio path available for the selected route; OS-level dynamics processing, automatic gain control (AGC), and acoustic echo cancellation (AEC) are suppressed on a best-effort basis. Because hardware audio pipelines across Apple devices and accessory routes (built-in speakerphone vs. wired Lightning/USB-C dongle) can exhibit device-dependent pre-emphasis or non-linear limiter behaviors, remaining route-specific hardware processing SHALL be characterized empirically per target device model. Background execution is preserved under `UIBackgroundModes = ["audio"]`, where continuous execution of the real-time audio render callback prevents iOS from suspending the Main App process when backgrounded or when the device screen is locked.
+   * **Audio Session Configuration:** The app initializes `AVAudioSession.sharedInstance()` with category `.playAndRecord`, mode `.measurement`, and options `[.allowBluetooth, .mixWithOthers]`. Mode `.measurement` requests the least-processed audio path available for the selected route; OS-level dynamics processing, automatic gain control (AGC), and acoustic echo cancellation (AEC) are suppressed on a best-effort basis. Because hardware audio pipelines across Apple devices and accessory routes (built-in speakerphone vs. wired Lightning/USB-C dongle) can exhibit device-dependent pre-emphasis or non-linear limiter behaviors, remaining route-specific hardware processing SHALL be characterized empirically per target device model. Background execution is preserved under `UIBackgroundModes = ["audio"]`, where continuous execution of the real-time audio render callback prevents iOS from suspending the Main App process when backgrounded or when the device screen is locked. *Note on App Store Policy:* Apple App Store Review Guidelines (Guideline 2.5.4) mandate that apps declaring the audio background mode provide audible sound playback or active voice communication audible to the user; headless or silent modem background streaming requires appropriate user-facing operational disclosure or foreground execution to maintain store compliance.
    * **NetworkExtension Lifecycle:** The NetworkExtension provider maintains packet handling while its tunnel session is active. Tunnel termination or provider restart is treated as a recoverable lifecycle event; the shared-memory protocol must tolerate producer/consumer disappearance and reattachment.
+
+6. **Startup IPC Shared-Memory Self-Test:**
+   Before establishing the network tunnel or passing production traffic, both the Main App and NetworkExtension execute an automated startup IPC self-test qualifying the lock-free SPSC shared memory queue across the App Group boundary:
+   * **File & Mapping Qualification:** Validates creation, pre-allocation sizing, and `mmap` mapping of the backing file in `group.org.vradm`.
+   * **Atomic Index Progression:** Validates release-acquire memory ordering and atomic sequence progression across producer and consumer.
+   * **Cache-Line Alignment Verification:** Validates that atomic indices (`head`, `tail`) reside on distinct 64-byte hardware cache lines (`uintptr_t(tail) - uintptr_t(head) >= 64`), ensuring zero false sharing between CPU cores.
+   * **Graceful Reattachment:** Validates that sudden termination and reattachment of either process cleanly recovers ring pointers without deadlock or buffer corruption.
 
 ---
 
@@ -1103,14 +1208,14 @@ typedef struct vradm_engine vradm_engine_t;
  * ========================================================================= */
 
 typedef struct {
-    vradm_mcs_t  startup_mcs;          // [0]
-    uint8_t      reserved[3];          // [1..3]
-    vradm_rate_t sample_rate;          // [4..7]
-    uint8_t      auto_rate_adaptation; // [8]
-    uint8_t      psk_key[16];          // [9..24] 128-bit Pre-Shared Key for PLCP/CCF MAC
-    uint8_t      padding[3];           // [25..27]
-    float        tx_amplitude;         // [28..31] Target RMS ceiling (Default: 0.3535 = -9.0 dBFS RMS)
-} vradm_config_t; // Exactly 32 bytes
+    vradm_rate_t sample_rate;          // [0..3] Sampling rate (8000 or 16000 Hz)
+    vradm_mcs_t  startup_mcs;          // [4] Initial active MCS ladder state (0..4)
+    uint8_t      auto_rate_adaptation; // [5] Enable automatic link-metric rate adaptation (0/1)
+    uint8_t      reserved[2];          // [6..7] Struct padding / future expansion
+    float        tx_amplitude;         // [8..11] Target RMS ceiling (Default: 0.3535 = -9.0 dBFS RMS)
+    uint8_t      reserved2[4];         // [12..15] Struct padding
+    uint8_t      psk_key[16];          // [16..31] 128-bit Pre-Shared Key (16-Byte Naturally Aligned for SIMD)
+} vradm_config_t; // Exactly 32 bytes, 16-byte aligned
 
 typedef struct {
     float       estimated_snr_db;         // [0..3]
@@ -1149,7 +1254,7 @@ typedef struct {
 _Static_assert(sizeof(vradm_config_t) == 32, "vradm_config_t size mismatch: expected 32 bytes");
 _Static_assert(sizeof(vradm_telemetry_t) == 40, "vradm_telemetry_t size mismatch: expected 40 bytes");
 _Static_assert(sizeof(vradm_cmd_t) == 32, "vradm_cmd_t size mismatch: expected 32 bytes");
-_Static_assert(offsetof(vradm_config_t, psk_key) == 9, "vradm_config_t: psk_key offset mismatch");
+_Static_assert(offsetof(vradm_config_t, psk_key) == 16, "vradm_config_t: psk_key offset mismatch (must be 16-byte aligned)");
 _Static_assert(offsetof(vradm_telemetry_t, security_tamper_detected) == 8, "vradm_telemetry_t: security_tamper_detected offset mismatch");
 _Static_assert(offsetof(vradm_telemetry_t, sample_slip_accum) == 36, "vradm_telemetry_t: sample_slip_accum offset mismatch");
 _Static_assert(offsetof(vradm_cmd_t, param_u32) == 8, "vradm_cmd_t: param_u32 offset mismatch");
@@ -1188,10 +1293,9 @@ _Static_assert(offsetof(vradm_cmd_t, inline_payload) == 20, "vradm_cmd_t: inline
  *      While in the VRADM_SOTP_READY state, the audio pipeline and decoder are strictly
  *      prohibited from mutating the staging memory until the host thread finishes
  *      fetching or releases the object via VRADM_CMD_STOP_SOTP.
-
  *
  * 3. Telemetry / Diagnostics Thread:
- *    - Calls vradm_get_telemetry().
+ *    - Calls vradm_get_telemetry() and vradm_get_active_mcs().
  *    - Safe to invoke concurrently from any thread at any time.
  *    - Race-Free Memory Model: Telemetry storage is internally double-buffered and
  *      protected by atomic sequence counters with C11/Rust acquire-release semantics.
@@ -1200,12 +1304,21 @@ _Static_assert(offsetof(vradm_cmd_t, inline_payload) == 20, "vradm_cmd_t: inline
  *      samples seq1 (atomic acquire), copies the struct, and verifies seq2 (atomic acquire).
  *      Reads retry if (seq1 != seq2 || (seq1 & 1) != 0), guaranteeing tear-free atomic
  *      snapshots with zero undefined behavior or data races under language memory models.
+ *    - Lightweight Active MCS Getter: vradm_get_active_mcs() directly executes an atomic
+ *      load on engine->active_tx_mcs, bypassing the seqlock loop for zero-overhead
+ *      window clamping decisions in the TCP-PEP.
  *
- * 4. Engine Lifecycle Operations:
+ * 4. Engine Lifecycle & Quiescence Contract:
  *    - vradm_create(), vradm_reset(), vradm_destroy().
- *    - Strictly prohibited while audio callbacks or network polling threads are
- *      active on the instance. Calling vradm_destroy() concurrently with audio
- *      processing produces undefined behavior.
+ *    - Quiescence Invariant: vradm_reset() and vradm_destroy() are strictly prohibited while
+ *      audio render callbacks or host polling threads are actively executing against the instance.
+ *    - Standard Safe Reset Sequence (e.g. during iOS NetworkExtension restart or call renegotiation):
+ *      1. Set a platform atomic flag (e.g. is_paused = true) instructing the real-time audio callback to
+ *         synthesize silence/zero samples and immediately return without calling vradm_generate_audio()
+ *         or vradm_process_audio().
+ *      2. Wait for any in-flight host thread call (vradm_write_ip_packet, vradm_poll_ip_packet) to finish.
+ *      3. Call vradm_reset(engine).
+ *      4. Clear is_paused flag to resume normal real-time processing.
  * ========================================================================= */
 
 /* --- Engine Lifecycle Management (Thread-Safe under Single-Owner Discipline) --- */
@@ -1229,8 +1342,9 @@ int32_t vradm_sotp_stage_tx_payload(vradm_engine_t* engine, const uint8_t* paylo
 int32_t vradm_sotp_rx_poll(vradm_engine_t* engine, uint32_t* out_collected_symbols, uint32_t* out_required_symbols);
 int32_t vradm_sotp_rx_fetch(vradm_engine_t* engine, uint8_t* out_buf, uint32_t max_len, uint8_t out_hash[28]); // 28-byte BLAKE3_224 digest
 
-/* --- Telemetry & Link Status (Race-Free Seqlock Snapshot) --- */
-void vradm_get_telemetry(const vradm_engine_t* engine, vradm_telemetry_t* out_telem);
+/* --- Telemetry & Link Status (Race-Free Seqlock Snapshot & Lightweight Atomic Getters) --- */
+void        vradm_get_telemetry(const vradm_engine_t* engine, vradm_telemetry_t* out_telem);
+vradm_mcs_t vradm_get_active_mcs(const vradm_engine_t* engine); // Zero-overhead atomic load for PEP window clamping
 
 #ifdef __cplusplus
 }
@@ -1260,7 +1374,7 @@ void vradm_get_telemetry(const vradm_engine_t* engine, vradm_telemetry_t* out_te
 
 | ID | Test Category | Channel Configuration | Injected Impairment | Pass / Fail Acceptance Criteria |
 | --- | --- | --- | --- | --- |
-| **TC-01** | Math Loopback & Codec Test Vectors | In-memory loopback | Zero noise, synchronous clock | Zero observed bit errors over $30 \times 10^6$ tested bits ($\implies P_e \le 1.0 \times 10^{-7}$ at 95% Clopper-Pearson confidence). Zero RS corrections.<br>• **Golay Test Vectors:** Systematic Extended Golay $[24, 12, 8]$ codec verifies $G G^T \equiv 0 \pmod 2$, $P_{12} P_{12}^T \equiv I_{12} \pmod 2$, exact weight enumerator ($A_0=1, A_8=759, A_{12}=2576, A_{16}=759, A_{24}=1$), and $d_{\text{min}} = 8$.<br>• **Preamble Continuity:** Barker-13 dual-chirp verifies zero phase jump at mid-chip transition ($m=20$, $\Delta\theta = 0\text{ rad}$) and chip boundary ($m=40$, $\theta \equiv 0\pmod{2\pi}$). |
+| **TC-01** | Math Loopback & Codec Test Vectors | In-memory loopback | Zero noise, synchronous clock | Zero observed bit errors over $30 \times 10^6$ tested bits ($\implies P_e \le 1.0 \times 10^{-7}$ at 95% Clopper-Pearson confidence). Zero uncorrected RS errors.<br>• **Reed-Solomon Test Vectors:** Systematic $\text{RS}(64, 48)$ and $\text{RS}(16, 8)$ codecs verify bit-exact generator polynomial remainder parity and zero syndromes on standard test vectors; GMD errors-and-erasures decoder satisfies $2s + e \le 16$ and bounds decoder burden $B = \frac{2s + e}{16} \in [0.0, 1.0]$ with $B = 1.0$ on decoding failure ($2s + e > 16$).<br>• **Golay Test Vectors & Bit Partitioning:** Systematic Extended Golay $[24, 12, 8]$ codec verifies $G G^T \equiv 0 \pmod 2$, $P_{12} P_{12}^T \equiv I_{12} \pmod 2$, exact weight enumerator ($A_0=1, A_8=759, A_{12}=2576, A_{16}=759, A_{24}=1$), $d_{\text{min}} = 8$, encoding vector $\text{0x5A5} \to \mathbf{\text{0x5A51D9}}$, and 3-bit error correction $\mathbf{\text{0xFA5199}} \to \mathbf{\text{0x5A5}}$. Bit-exact packing across Codewords 1 & 2 ($m^{(1)} = \text{CUR\_MCS}[3] \mid \text{REQ\_MCS}[3] \mid \text{TX\_PWR}[2] \mid \text{BEAC\_SEQ}[7..4]$ and $m^{(2)} = \text{BEAC\_SEQ}[3..0] \mid \text{BEACON\_MAC8}[8]$) round-trips with zero bit displacement across all $2^{24}$ combinations.<br>• **MCS 1 Codec Verification:** Bit-exact parameter mapping round-trips all 256 symbol values ($S \in [0, 255]$) across formant pair table $\{F_1, F_2\}$, pitch lag table $P \in \{33 \dots 80\}$, and onset sample offset $\delta \in \{0 \dots 3\}$ with zero quantization mismatch.<br>• **Data Structure SIMD Alignment:** ABI layout test verifies $\text{sizeof}(\text{vradm\_config\_t}) = 32$, $\text{sizeof}(\text{vradm\_cmd\_t}) = 32$, $\text{sizeof}(\text{vradm\_telemetry\_t}) = 40$, and $\text{offsetof}(\text{vradm\_config\_t, psk\_key}) = 16$ ensuring 128-bit natural SIMD alignment for cryptographic and vectorized vector processing.<br>• **Preamble Waveform Limits:** Barker-13 dual-chirp verifies zero phase jump at mid-chip transition ($m=20$, $\Delta\theta = 0\text{ rad}$), chip boundary phase entry ($m=40$, $\theta \equiv 0\pmod{2\pi}$), continuous intra-chip sample step $|s[n] - s[n-1]| \le 1.20$, and inter-chip boundary step $|s[40k] - s[40k-1]| \le 0.30$. |
 | **TC-02** | AMR-NB Robustness | AMR-NB @ 12.2 kbps | Injected channel erasure rate = 1.0%; AWGN $\text{SNR} = 18\text{ dB}$ | Zero unrecoverable frames over 30,000 frames ($\implies P_{\text{FER}} \le 1.0 \times 10^{-4}$ at 95% Clopper-Pearson confidence). Zero payload corruption. |
 | **TC-03** | Dynamic Codec Adaptation | AMR-NB stepped down from 12.2k to 4.75k | Mode switch occurs at Frame 100 | Link metric $M$ initiates automatic downshift to MCS 1 within 4 frames. Zero dropped IP packets. |
 | **TC-04a** | Balanced Cellular Gate (MCS 2) | AMR-NB @ 12.2 kbps | Injected channel $\text{SNR} = 18\text{ dB}$, clock drift $\pm 50\text{ PPM}$ | Multi-carrier 4th-power NDA DLL maintains phase-aligned carrier and timing lock. Measured Application Goodput $R_{\text{APP}} \ge 250\text{ bps}$ for SSH/TCP-PEP or $\ge 320\text{ bps}$ for UDP bulk stream (against theoretical L3 maximum $431.92\text{ bps}$). $P_{\text{FER}} \le 1.0 \times 10^{-3}$. Zero RS decode crashes. |
