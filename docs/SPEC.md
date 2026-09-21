@@ -1,6 +1,6 @@
 # Engineering Specification: Vocoder-Resilient Acoustic Data Modem (V-RADM)
 
-**Document Version:** 3.8.9
+**Document Version:** 3.8.10
 
 **Status:** Closed Baseline Engineering Specification (Implementation-Ready Research Prototype)
 
@@ -622,7 +622,9 @@ To prevent unauthorized over-the-air injection of corrupted PLCP commands, accid
     yielding 24-bit encoded codeword $c^{(2)} = (m^{(2)} \ll 12) \mid (m^{(2)} \cdot P_{12} \pmod 2)$.
   * **Serialized Transmission:** Codeword 1 ($c^{(1)}$, 24 bits, MSB first) is serialized immediately followed by Codeword 2 ($c^{(2)}$, 24 bits, MSB first), forming the complete 48-bit header payload.
 * `PLCP_MODULATION`: 2-FSK ($1200\text{ Hz} = \text{Mark}, 1600\text{ Hz} = \text{Space}$) at $100\text{ Bd}$ ($10.0\text{ ms/bit}$). Total header duration = $48 \times 10.0\text{ ms} = \mathbf{480.0\text{ ms}}$.
-* `PLCP_TOTAL_DURATION`: $65.0 + 10.0 + 480.0 + 10.0 = \mathbf{565.0\text{ ms}}$.
+* `PLCP_TOTAL_DURATION`:
+  * **Nominal Baseline (MCS 0, 1, 2, 4):** $65.0\text{ ms (Barker-13)} + 10.0\text{ ms (inter-burst guard)} + 480.0\text{ ms (2-FSK header)} + 10.0\text{ ms (post-beacon guard)} = \mathbf{565.0\text{ ms}}$ ($4,520\text{ samples at } 8\text{ kHz}$).
+  * **MCS 3 ACELP / AudioSocket Phase-Locked Exception (§3.2):** When operating in MCS 3, to maintain joint phase-locking across 5.0 ms ACELP subframes ($40\text{ samples}$) and 20 ms AudioSocket PCM blocks ($160\text{ samples}$), the inter-burst guard between preamble and beacon is zeroed, and the post-beacon guard silence is set to $35.0\text{ ms}$ ($280\text{ samples}$): $65.0\text{ ms (Barker-13)} + 480.0\text{ ms (2-FSK)} + 35.0\text{ ms (guard)} = \mathbf{580.0\text{ ms}}$ ($4,640\text{ samples} = 116 \times 40 = 29 \times 160$). Implementers of the PLCP waveform generator MUST apply this 4,640-sample duration whenever MCS 3 is the active transmit mode to avoid phase misalignment across vocoder analysis subframes.
 * **Cadence:** PLCP is transmitted at `SESSION_START`, `TDD_DATA_TURN`, `CONTINUOUS_SYNC` (every 16 frames), and `MCS_CHANGE`. *Compact Control Frames (CCFs) do NOT require a PLCP beacon.*
 
 #### Barker-13 Dual-Chirp Waveform Construction
