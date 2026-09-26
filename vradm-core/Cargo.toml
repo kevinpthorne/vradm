@@ -5,4 +5,13 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "vradm_core"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
 [dependencies]
+# Pin a release verified with the current Rust 1.76 toolchain.
+blake3 = "=1.8.2"
+siphasher = "1.0"
+subtle = "2.6"
+getrandom = "0.2"

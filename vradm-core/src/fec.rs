@@ -127,13 +127,17 @@ pub fn rs_encode_16_8(info: &[u8; 8]) -> [u8; 16] {
     codeword
 }
 
+const MAX_T2: usize = 16;
+const MAX_N: usize = 64;
+
 fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) -> Result<(), ()> {
     let t2 = n - k;
-    if erasures.len() > t2 {
+    if erasures.len() > t2 || t2 > MAX_T2 || n > MAX_N {
         return Err(());
     }
-    
-    let mut syn = vec![0u8; t2];
+
+    // 1. Syndrome computation (stack array [u8; 16])
+    let mut syn = [0u8; MAX_T2];
     let mut has_error = false;
     for j in 0..t2 {
         let root = EXP[j];
@@ -142,16 +146,21 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
             sum = mul(sum, root) ^ recv[i];
         }
         syn[j] = sum;
-        if sum != 0 { has_error = true; }
+        if sum != 0 {
+            has_error = true;
+        }
     }
-    if !has_error { return Ok(()); }
-    
-    let mut lambda = vec![0u8; erasures.len() + 1];
+    if !has_error {
+        return Ok(());
+    }
+
+    // 2. Erasure locator polynomial lambda(x) (stack array [u8; 18])
+    let mut lambda = [0u8; MAX_T2 + 2];
     lambda[0] = 1;
     let mut lambda_deg = 0;
     for &pos in erasures {
         let x_j = EXP[(n - 1 - pos) % 255];
-        let mut next = vec![0u8; lambda_deg + 2];
+        let mut next = [0u8; MAX_T2 + 2];
         for i in 0..=lambda_deg {
             next[i] ^= lambda[i];
             next[i + 1] ^= mul(lambda[i], x_j);
@@ -159,8 +168,9 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
         lambda = next;
         lambda_deg += 1;
     }
-    
-    let mut t_syn = vec![0u8; t2];
+
+    // 3. Modified syndromes T(x) (stack array [u8; 16])
+    let mut t_syn = [0u8; MAX_T2];
     for i in 0..t2 {
         let mut sum = 0u8;
         for j in 0..=lambda_deg {
@@ -170,14 +180,15 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
         }
         t_syn[i] = sum;
     }
-    
-    let mut sigma = vec![0u8; t2 + 1];
+
+    // 4. Berlekamp-Massey iteration for error locator sigma(x)
+    let mut sigma = [0u8; MAX_T2 + 2];
     sigma[0] = 1;
-    let mut b = vec![0u8; t2 + 1];
+    let mut b = [0u8; MAX_T2 + 2];
     b[0] = 1;
     let mut l = 0;
     let mut m = 1;
-    
+
     for i in lambda_deg..t2 {
         let mut d = 0u8;
         for j in 0..=l {
@@ -186,14 +197,14 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
         if d == 0 {
             m += 1;
         } else {
-            let mut next_sigma = sigma.clone();
+            let mut next_sigma = sigma;
             for j in 0..=t2 {
                 if j >= m {
                     next_sigma[j] ^= mul(d, b[j - m]);
                 }
             }
             if 2 * l <= i - lambda_deg {
-                b = sigma.clone();
+                b = sigma;
                 for j in 0..=t2 {
                     b[j] = div(b[j], d);
                 }
@@ -205,12 +216,13 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
             sigma = next_sigma;
         }
     }
-    
+
     if 2 * l + lambda_deg > t2 {
         return Err(());
     }
 
-    let mut phi = vec![0u8; t2 + 1];
+    // 5. Total locator polynomial phi(x) = lambda(x) * sigma(x) (stack array [u8; 34])
+    let mut phi = [0u8; MAX_T2 * 2 + 2];
     for i in 0..=lambda_deg {
         for j in 0..=l {
             if i + j <= t2 {
@@ -219,8 +231,10 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
         }
     }
     let deg_phi = lambda_deg + l;
-    
-    let mut locs = vec![];
+
+    // 6. Chien search for error roots (stack array [usize; 16])
+    let mut locs = [0usize; MAX_T2];
+    let mut locs_len = 0;
     for i in 0..n {
         let x_inv = EXP[255 - (n - 1 - i) % 255];
         let mut sum = 0u8;
@@ -230,15 +244,20 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
             x_pow = mul(x_pow, x_inv);
         }
         if sum == 0 {
-            locs.push(i);
+            if locs_len >= MAX_T2 {
+                return Err(());
+            }
+            locs[locs_len] = i;
+            locs_len += 1;
         }
     }
-    
-    if locs.len() != deg_phi {
+
+    if locs_len != deg_phi {
         return Err(());
     }
-    
-    let mut omega = vec![0u8; t2];
+
+    // 7. Error evaluator omega(x) = (phi(x) * syn(x)) mod x^t2 (stack array [u8; 16])
+    let mut omega = [0u8; MAX_T2];
     for i in 0..t2 {
         let mut sum = 0u8;
         for j in 0..=deg_phi {
@@ -248,8 +267,9 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
         }
         omega[i] = sum;
     }
-    
-    for &pos in &locs {
+
+    // 8. Forney algorithm for error magnitudes
+    for &pos in &locs[..locs_len] {
         let x_inv = EXP[255 - (n - 1 - pos) % 255];
         let mut phi_prime = 0u8;
         let mut x_pow = 1u8;
@@ -257,21 +277,23 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
             phi_prime ^= mul(phi[j], x_pow);
             x_pow = mul(x_pow, mul(x_inv, x_inv));
         }
-        if phi_prime == 0 { return Err(()); }
-        
+        if phi_prime == 0 {
+            return Err(());
+        }
+
         let mut o_val = 0u8;
         let mut x_pow_o = 1u8;
         for j in 0..deg_phi {
             o_val ^= mul(omega[j], x_pow_o);
             x_pow_o = mul(x_pow_o, x_inv);
         }
-        
+
         let x_j = EXP[(n - 1 - pos) % 255];
         let mag = mul(x_j, div(o_val, phi_prime));
         recv[pos] ^= mag;
     }
-    
-    // Final syndrome check to guarantee we haven't falsely accepted an invalid codeword.
+
+    // 9. Final syndrome integrity check
     for j in 0..t2 {
         let root = EXP[j];
         let mut sum = 0u8;
@@ -282,7 +304,7 @@ fn rs_decode_generic(recv: &mut [u8], erasures: &[usize], n: usize, k: usize) ->
             return Err(());
         }
     }
-    
+
     Ok(())
 }
 

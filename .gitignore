@@ -1,3 +1,8 @@
 **/test*
 !**/test*.rs
 vradm-core/target/*
+# Keep Cargo integration tests visible even though test binaries are ignored.
+!**/tests/
+!**/tests/**
+/target/
+.agents/

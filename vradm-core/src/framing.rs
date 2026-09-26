@@ -36,7 +36,7 @@ pub fn deinterleave_8x8(input: &[u8; 64], output: &mut [u8; 64]) {
 
 pub const SYNC_WORD: u16 = 0xD391;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalDataFrame {
     pub ctrl: u8,
     pub seq: u8,
@@ -49,7 +49,7 @@ pub struct CanonicalDataFrame {
 impl CanonicalDataFrame {
     pub fn new() -> Self {
         Self {
-            ctrl: 0,
+            ctrl: 0x02, // Current v3.8 IP wire version
             seq: 0,
             ack_base: 0,
             ack_map: 0,
@@ -86,18 +86,20 @@ impl CanonicalDataFrame {
         let mut codeword = [0u8; 64];
         deinterleave_8x8(interleaved, &mut codeword);
         
-        if u16::from_be_bytes([codeword[0], codeword[1]]) != SYNC_WORD {
-            return Err("Invalid SYNC_WORD");
-        }
-        
-        let mut logical_erasures = Vec::new();
+        let mut logical_erasures = [0usize; 16];
+        let mut log_count = 0;
         for &e in erasures {
-            if e < 64 {
-                logical_erasures.push((e % 8) * 8 + (e / 8));
+            if e < 64 && log_count < 16 {
+                logical_erasures[log_count] = (e % 8) * 8 + (e / 8);
+                log_count += 1;
             }
         }
         
-        rs_decode_64_48(&mut codeword, &logical_erasures).map_err(|_| "RS decode failed")?;
+        rs_decode_64_48(&mut codeword, &logical_erasures[..log_count]).map_err(|_| "RS decode failed")?;
+
+        if u16::from_be_bytes([codeword[0], codeword[1]]) != SYNC_WORD {
+            return Err("Invalid SYNC_WORD");
+        }
         
         if header_crc8(&codeword[2..7]) != codeword[7] {
             return Err("Header CRC8 mismatch");
@@ -157,14 +159,16 @@ impl CompactControlFrame {
     }
 
     pub fn decode(mut codeword: [u8; 16], erasures: &[usize]) -> Result<Self, &'static str> {
-        let mut valid_erasures = Vec::new();
+        let mut valid_erasures = [0usize; 8];
+        let mut valid_count = 0;
         for &e in erasures {
-            if e < 16 {
-                valid_erasures.push(e);
+            if e < 16 && valid_count < 8 {
+                valid_erasures[valid_count] = e;
+                valid_count += 1;
             }
         }
         
-        rs_decode_16_8(&mut codeword, &valid_erasures).map_err(|_| "RS decode failed")?;
+        rs_decode_16_8(&mut codeword, &valid_erasures[..valid_count]).map_err(|_| "RS decode failed")?;
 
         if u16::from_be_bytes([codeword[0], codeword[1]]) != SYNC_WORD {
             return Err("Invalid SYNC_WORD");
@@ -272,5 +276,28 @@ mod tests {
 
         let decoded_corrupted = CompactControlFrame::decode(corrupted, &[]).unwrap();
         assert_eq!(ccf, decoded_corrupted);
+    }
+
+    #[test]
+    fn test_canonical_data_frame_corrupted_sync() {
+        let mut frame = CanonicalDataFrame::new();
+        frame.ctrl = 0x02;
+        frame.seq = 42;
+        frame.ack_base = 40;
+        frame.ack_map = 0x03;
+        frame.payload_len = 10;
+        frame.payload[..10].copy_from_slice(b"sync_test!");
+
+        let interleaved = frame.encode();
+
+        // Corrupt byte 0 of codeword before interleaving would correspond to interleaved[0]
+        // because deinterleave_8x8 maps (0 % 8)*8 + (0 / 8) = 0.
+        // Let's corrupt interleaved[0] which maps to codeword[0] (part of SYNC_WORD 0xD391).
+        let mut corrupted = interleaved;
+        corrupted[0] ^= 0xFF; // Corrupts high byte of SYNC_WORD from 0xD3 to 0x2C
+
+        // RS decode should correct the corrupted sync byte and successfully decode
+        let decoded = CanonicalDataFrame::decode(&corrupted, &[]).expect("RS decode should fix corrupted sync byte");
+        assert_eq!(frame, decoded);
     }
 }
