@@ -126,3 +126,9 @@ ownership. EOT tones themselves are unauthenticated and cannot grant a token.
 The aligned receiver adds no live engine routing, playback acknowledgment,
 collision recovery or acquisition of an unknown CCF boundary. Timing/codec/drift
 qualification and receive schedulers remain future work.
+
+## Live full-duplex integration
+
+[LIVE_CCF.md](LIVE_CCF.md) describes the new phase-bank acquisition and live engine
+standalone-ACK path. It does not use aligned EOT/guard completion as an acoustic
+ownership signal; the aligned components above keep their original contracts.

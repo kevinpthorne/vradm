@@ -166,6 +166,26 @@ pub struct UnverifiedCcf {
     erasure_count: usize,
 }
 impl UnverifiedCcf {
+    pub(crate) fn from_decisions(wire: [u8; 16], erased: &[bool; 16]) -> Result<Self, CcfPcmError> {
+        let mut erasures = [0; 8];
+        let mut count = 0;
+        for (index, &bad) in erased.iter().enumerate() {
+            if bad {
+                if count == 8 {
+                    return Err(CcfPcmError::TooManyErasures);
+                }
+                erasures[count] = index;
+                count += 1;
+            }
+        }
+        CompactControlFrame::decode(wire, &erasures[..count])
+            .map_err(|_| CcfPcmError::ChannelIntegrity)?;
+        Ok(Self {
+            wire,
+            erasures,
+            erasure_count: count,
+        })
+    }
     pub fn codeword(&self) -> [u8; 16] {
         self.wire
     }
@@ -235,23 +255,6 @@ impl CcfPitchReceiver {
         }
     }
     fn finish(&self) -> Result<UnverifiedCcf, CcfPcmError> {
-        let mut erasures = [0; 8];
-        let mut count = 0;
-        for (index, &erased) in self.erased.iter().enumerate() {
-            if erased {
-                if count == 8 {
-                    return Err(CcfPcmError::TooManyErasures);
-                }
-                erasures[count] = index;
-                count += 1;
-            }
-        }
-        CompactControlFrame::decode(self.wire, &erasures[..count])
-            .map_err(|_| CcfPcmError::ChannelIntegrity)?;
-        Ok(UnverifiedCcf {
-            wire: self.wire,
-            erasures,
-            erasure_count: count,
-        })
+        UnverifiedCcf::from_decisions(self.wire, &self.erased)
     }
 }

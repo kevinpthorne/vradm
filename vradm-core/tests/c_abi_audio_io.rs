@@ -739,3 +739,60 @@ fn amplitude_command_and_live_burst_conditioning_allocate_nothing() {
     assert_eq!(THREAD_ALLOC_COUNT.with(|c| c.get()), 0);
     assert_eq!(THREAD_DEALLOC_COUNT.with(|c| c.get()), 0);
 }
+
+#[test]
+fn integrated_endpoint_audio_callbacks_allocate_nothing_across_handoff() {
+    use vradm_core::{endpoint::Endpoint, session::{NonceSource, SessionError}};
+    struct Source(u8);
+    impl NonceSource for Source {
+        fn nonce(&mut self) -> Result<[u8;16], SessionError> {
+            self.0 += 1; Ok([self.0;16])
+        }
+    }
+    let config = vradm_config_t { sample_rate: 8000, startup_mcs: 2, auto_rate_adaptation: 0,
+        reserved: [0;2], tx_amplitude: 0.1334, reserved2: [0;4], psk_key: [1;16] };
+    let mut a = Endpoint::<16>::new(config,0).unwrap();
+    let mut b = Endpoint::<16>::new(config,0).unwrap();
+    let (mut ah,mut aa) = a.split_with_entropy(Source(2)).unwrap();
+    let (mut bh,mut ba) = b.split_with_entropy(Source(20)).unwrap();
+    ah.begin(0).unwrap();
+    let mut apcm = [0;160]; let mut bpcm = [0;160];
+    let mut sent = false;
+    THREAD_ALLOC_COUNT.with(|c| c.set(0));
+    THREAD_DEALLOC_COUNT.with(|c| c.set(0));
+    for step in 0..1000 {
+        // Host worker is deliberately outside allocation tracking.
+        ah.pump(step*20).unwrap(); bh.pump(step*20).unwrap();
+        if ah.ready() && bh.ready() && !sent {
+            assert_eq!(bh.set_channel_metric(0.95), VRADM_OK);
+            assert_eq!(ah.request_upshift(3), VRADM_OK);
+            assert_eq!(ah.write_ip_packet(&[42;19]), VRADM_OK);
+            assert_eq!(bh.write_ip_packet(&[43;19]), VRADM_OK);
+            sent = true;
+        }
+        if step == 700 {
+            let mut telemetry = unsafe { std::mem::zeroed() };
+            ah.get_telemetry(&mut telemetry);
+            assert_eq!(telemetry.active_tx_mcs, 3);
+            assert_eq!(ah.emergency_downshift(0.5), VRADM_OK);
+        }
+        THREAD_TRACKING.with(|t| t.set(true));
+        aa.generate_audio(&mut apcm); ba.generate_audio(&mut bpcm);
+        aa.process_audio(&bpcm); ba.process_audio(&apcm);
+        if let Some(fence) = aa.playback_fence() { aa.acknowledge_played(fence); }
+        if let Some(fence) = ba.playback_fence() { ba.acknowledge_played(fence); }
+        THREAD_TRACKING.with(|t| t.set(false));
+    }
+    assert_eq!(THREAD_ALLOC_COUNT.with(|c| c.get()), 0);
+    assert_eq!(THREAD_DEALLOC_COUNT.with(|c| c.get()), 0);
+    assert!(sent);
+    assert_eq!(ah.ccf_counts(), (1,2));
+    assert_eq!(bh.ccf_counts(), (2,1));
+    let mut telemetry = unsafe { std::mem::zeroed() };
+    ah.get_telemetry(&mut telemetry);
+    assert_eq!(telemetry.active_tx_mcs, 2);
+    bh.get_telemetry(&mut telemetry);
+    assert_eq!(telemetry.active_rx_mcs, 2);
+    assert_eq!(ah.poll_ip_packet(&mut [0;296]), 19);
+    assert_eq!(bh.poll_ip_packet(&mut [0;296]), 19);
+}

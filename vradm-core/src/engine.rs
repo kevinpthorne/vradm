@@ -1,3 +1,7 @@
+use crate::ccf_stream::CcfStreamReceiver;
+use crate::ccf_turn::CcfTurnTransmitter;
+use crate::security::{ControlCommand, ControlRequest};
+use crate::mcs_control::{McsCommit, MCS_UPSHIFT_ATTEMPTS, MCS_COOLDOWN_MS};
 use crate::session::{SessionRole, SessionTransfer};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -240,10 +244,54 @@ pub struct QueuedCommand {
     command: vradm_cmd_t,
     generation: u32,
     session: Option<SessionTransfer>,
+    endpoint_command: Option<EndpointCommand>,
+}
+
+#[derive(Clone, Copy)]
+enum EndpointCommand { Upshift, ChannelMetric(f32), EmergencyDownshift }
+
+/// Live MCS2→3 request state. Acceptance is asynchronous; Applied is reflected
+/// by active_tx_mcs == 3 and Idle. Reset discards every pending plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RateChangeStatus { Idle, Draining, AwaitingReply, AwaitingBoundary, Cooldown }
+
+#[derive(Clone, Copy)]
+enum LiveUpshift {
+    Idle,
+    Draining,
+    Awaiting { attempts: u8, deadline: u64 },
+    Accepted(McsCommit),
+    Cooldown { started: u64 },
 }
 
 // Project-profile confirmation recovery is paced by rendered 8 kHz samples.
 const CONFIRMATION_RETRY_SAMPLES: u64 = 6 * 8000;
+
+// Opt-in digital/full-duplex CCF feedback. Not acoustic TDD ownership.
+struct CcfMedia {
+    rx: CcfStreamReceiver,
+    tx: CcfTurnTransmitter,
+    peer: Option<(u16, u8)>,
+    burst_needs_ack: bool,
+    reply_ready: bool,
+    peer_request: u8,
+    channel_metric: Option<f32>,
+    upshift: LiveUpshift,
+    receive_commit: Option<McsCommit>,
+    announce_rate: bool,
+}
+impl CcfMedia {
+    fn new() -> Self { Self { rx: CcfStreamReceiver::new(), tx: CcfTurnTransmitter::new(),
+        peer: None, burst_needs_ack: false, reply_ready: false, peer_request: 0,
+        channel_metric: None, upshift: LiveUpshift::Idle, receive_commit: None, announce_rate: false } }
+    fn reset(&mut self) {
+        self.rx.reset(); self.tx.cancel(); self.peer = None;
+        self.burst_needs_ack = false; self.reply_ready = false;
+        self.peer_request = 0; self.channel_metric = None;
+        self.upshift = LiveUpshift::Idle; self.receive_commit = None; self.announce_rate = false;
+    }
+}
 
 struct AudioSecurity {
     session: SessionTransfer,
@@ -437,6 +485,12 @@ pub struct vradm_engine {
     pub awaiting_peer_turn: AtomicBool,
     // Audio-thread owned feedback and sample-clock retransmission deadline.
     authentication_required: bool,
+    compact_feedback: bool,
+    ccf_media: UnsafeCell<Option<Box<CcfMedia>>>,
+    ccf_sent: AtomicU64,
+    ccf_received: AtomicU64,
+    rate_status: AtomicU8,
+    downshift_pending: AtomicBool,
     authenticated_generation: AtomicU64,
     audio_security: UnsafeCell<Option<AudioSecurity>>,
     host_generation: AtomicU32,
@@ -508,6 +562,57 @@ impl HostHandle<'_> {
             == self.engine.host_generation.load(Ordering::Acquire) as u64 + 1
     }
 
+    pub fn rate_change_status(&self) -> RateChangeStatus {
+        match self.engine.rate_status.load(Ordering::Acquire) {
+            1 => RateChangeStatus::Draining,
+            2 => RateChangeStatus::AwaitingReply,
+            3 => RateChangeStatus::AwaitingBoundary,
+            4 => RateChangeStatus::Cooldown,
+            _ => RateChangeStatus::Idle,
+        }
+    }
+    pub(crate) fn request_upshift(&mut self, target: u8) -> i32 {
+        if target != 3 { return VRADM_ERR_INVALID_ARG; }
+        if !self.engine.compact_feedback || !self.authenticated_ready()
+            || self.get_active_mcs() != 2
+            || self.engine.downshift_pending.load(Ordering::Acquire) { return VRADM_ERR_STATE; }
+        if self.engine.rate_status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return VRADM_ERR_STATE;
+        }
+        let result = self.queue_endpoint_command(EndpointCommand::Upshift);
+        if result != VRADM_OK { self.engine.rate_status.store(0, Ordering::Release); }
+        result
+    }
+    pub(crate) fn emergency_downshift(&mut self, metric: f32) -> i32 {
+        if !metric.is_finite() || !(0.0..0.60).contains(&metric) {
+            return VRADM_ERR_INVALID_ARG;
+        }
+        if !self.engine.compact_feedback || !self.authenticated_ready() {
+            return VRADM_ERR_STATE;
+        }
+        if self.engine.downshift_pending.swap(true, Ordering::AcqRel) { return VRADM_ERR_STATE; }
+        let result = self.queue_endpoint_command(EndpointCommand::EmergencyDownshift);
+        if result != VRADM_OK { self.engine.downshift_pending.store(false, Ordering::Release); }
+        result
+    }
+    pub(crate) fn set_channel_metric(&mut self, metric: f32) -> i32 {
+        if !metric.is_finite() || !(0.0..=1.0).contains(&metric) { return VRADM_ERR_INVALID_ARG; }
+        if !self.engine.compact_feedback || !self.authenticated_ready() { return VRADM_ERR_STATE; }
+        self.queue_endpoint_command(EndpointCommand::ChannelMetric(metric))
+    }
+    fn queue_endpoint_command(&mut self, command: EndpointCommand) -> i32 {
+        let queued = QueuedCommand {
+            command: vradm_cmd_t { cmd_type: VRADM_CMD_NONE, cmd_id: 0, param_u32: 0,
+                param_i32: 0, param_f32: 0.0, inline_payload: [0; 12] },
+            generation: self.engine.host_generation.load(Ordering::Relaxed),
+            session: None, endpoint_command: Some(command),
+        };
+        // This unique HostHandle is the sole producer.
+        if unsafe { self.engine.cmd_queue.push_shared(queued) }.is_err() {
+            VRADM_ERR_QUEUE_FULL
+        } else { VRADM_OK }
+    }
+
     pub fn submit_cmd(&mut self, cmd: &vradm_cmd_t) -> i32 {
         unsafe { self.engine.submit_cmd(cmd) }
     }
@@ -547,6 +652,10 @@ impl HostHandle<'_> {
     pub fn get_active_mcs(&self) -> u8 {
         self.engine.get_active_mcs()
     }
+    pub fn ccf_counts(&self) -> (u64, u64) {
+        (self.engine.ccf_sent.load(Ordering::Relaxed), self.engine.ccf_received.load(Ordering::Relaxed))
+    }
+
 }
 
 impl AudioHandle<'_> {
@@ -555,7 +664,7 @@ impl AudioHandle<'_> {
     /// engine burst must finish first; it never cuts that burst short.
     pub fn service_commands(&mut self) -> bool {
         unsafe {
-            if (*self.engine.tx_audio_ring.get()).available_read() != 0 {
+            if self.engine.audio_burst_pending() {
                 return false;
             }
             self.engine.process_cmds_on_audio_thread();
@@ -607,6 +716,21 @@ impl vradm_engine {
         Ok(engine)
     }
 
+    /// Opt-in software/full-duplex profile with streamed authenticated CCF ACKs.
+    /// Acoustic TDD and negotiated MCS switching are not implemented here.
+    pub fn new_ccf_endpoint(config: vradm_config_t) -> Result<Box<Self>, i32> {
+        if config.auto_rate_adaptation != 0 { return Err(VRADM_ERR_INVALID_ARG); }
+        let mut engine = Self::new_authenticated(config)?;
+        engine.compact_feedback = true;
+        unsafe { *engine.ccf_media.get() = Some(Box::new(CcfMedia::new())); }
+        Ok(engine)
+    }
+
+    unsafe fn audio_burst_pending(&self) -> bool {
+        (*self.tx_audio_ring.get()).available_read() != 0
+            || (*self.ccf_media.get()).as_ref().map_or(false, |m| m.tx.remaining_samples() != 0)
+    }
+
     pub fn new(config: vradm_config_t) -> Self {
         let mut phy_tx = PhyTransmitter::new(config.startup_mcs);
         // Legacy infallible Rust construction fails silent on invalid amplitude.
@@ -640,6 +764,12 @@ impl vradm_engine {
             beac_seq_counter: AtomicU8::new(1),
             awaiting_peer_turn: AtomicBool::new(false),
             authentication_required: false,
+            compact_feedback: false,
+            ccf_media: UnsafeCell::new(None),
+            ccf_sent: AtomicU64::new(0),
+            ccf_received: AtomicU64::new(0),
+            rate_status: AtomicU8::new(0),
+            downshift_pending: AtomicBool::new(false),
             authenticated_generation: AtomicU64::new(0),
             audio_security: UnsafeCell::new(None),
             host_generation: AtomicU32::new(0),
@@ -692,6 +822,11 @@ impl vradm_engine {
 
     // Does not consume host-owned queues or touch host-owned object buffers.
     unsafe fn reset_link_on_audio_thread(&self) {
+        if let Some(media) = (*self.ccf_media.get()).as_mut() { media.reset(); }
+        self.ccf_sent.store(0, Ordering::Relaxed);
+        self.ccf_received.store(0, Ordering::Relaxed);
+        self.rate_status.store(0, Ordering::Release);
+        self.downshift_pending.store(false, Ordering::Release);
         *self.audio_security.get() = None;
         self.authenticated_generation.store(0, Ordering::Release);
         unsafe {
@@ -733,6 +868,9 @@ impl vradm_engine {
     /// SOTP operations; no direct reset, destruction, or internal-state access
     /// may overlap. The sole audio owner may run concurrently.
     pub unsafe fn submit_cmd(&self, cmd: &vradm_cmd_t) -> i32 {
+        if self.compact_feedback && cmd.cmd_type == VRADM_CMD_REQUEST_MCS {
+            return VRADM_ERR_STATE; // Use the typed endpoint negotiation path.
+        }
         if cmd.cmd_type == VRADM_CMD_SET_TX_PARAMS
             && (!cmd.param_f32.is_finite() || !(0.0..=1.0).contains(&cmd.param_f32)) {
             return VRADM_ERR_INVALID_ARG;
@@ -753,6 +891,7 @@ impl vradm_engine {
                 command: *cmd,
                 generation,
                 session: None,
+                endpoint_command: None,
             })
             .is_err()
         {
@@ -799,6 +938,7 @@ impl vradm_engine {
             command,
             generation,
             session: Some(session),
+            endpoint_command: None,
         }) {
             return Err((VRADM_ERR_QUEUE_FULL, queued.session.unwrap()));
         }
@@ -1001,6 +1141,37 @@ impl vradm_engine {
                     .store(queued.generation as u64 + 1, Ordering::Release);
                 continue;
             }
+            if let Some(command) = queued.endpoint_command {
+                if queued.generation == self.audio_generation.load(Ordering::Relaxed) {
+                    if let Some(media) = (*self.ccf_media.get()).as_mut() {
+                        match command {
+                            EndpointCommand::Upshift => media.upshift = LiveUpshift::Draining,
+                            EndpointCommand::ChannelMetric(metric) => media.channel_metric = Some(metric),
+                            EndpointCommand::EmergencyDownshift => {
+                                if let Some(security) = (*self.audio_security.get()).as_mut() {
+                                    let now = security.session.clock_ms.saturating_add(
+                                        security.capture_samples.max(security.render_samples) / 8);
+                                    security.session.tx.reject_control(now).expect("monotonic sample clock");
+                                }
+                                // Preserve both ARQ queues and any pre-existing
+                                // cooldown. Only this direction's request is canceled.
+                                if !matches!(media.upshift, LiveUpshift::Cooldown { .. }) {
+                                    media.upshift = LiveUpshift::Idle;
+                                    self.rate_status.store(RateChangeStatus::Idle as u8, Ordering::Release);
+                                }
+                                media.rx.reset();
+                                media.announce_rate = true;
+                                self.awaiting_peer_turn.store(false, Ordering::Release);
+                                self.peer_wait_samples.store(0, Ordering::Relaxed);
+                                self.active_tx_mcs.store(2, Ordering::Release);
+                                self.telem_seqlock.update(|t| t.active_tx_mcs = 2);
+                                self.downshift_pending.store(false, Ordering::Release);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             let cmd = queued.command;
             match cmd.cmd_type {
                 VRADM_CMD_SET_TX_PARAMS => {
@@ -1036,7 +1207,7 @@ impl vradm_engine {
         if out_samples.is_empty() {
             return 0;
         }
-        if unsafe { (*self.tx_audio_ring.get()).available_read() } == 0 {
+        if !self.audio_burst_pending() {
             self.process_cmds_on_audio_thread();
         }
 
@@ -1062,6 +1233,61 @@ impl vradm_engine {
         if self.authentication_required && (*self.audio_security.get()).is_none() {
             out_samples.fill(0);
             return out_samples.len() as u32;
+        }
+
+        if let Some(media) = (*self.ccf_media.get()).as_mut() {
+            if media.tx.remaining_samples() != 0 {
+                media.tx.render(out_samples);
+                return out_samples.len() as u32;
+            }
+            let security = (*self.audio_security.get()).as_mut().expect("authenticated CCF profile");
+            let now = security.session.clock_ms.saturating_add(
+                security.render_samples.max(security.capture_samples) / 8);
+            if media.reply_ready {
+                media.reply_ready = false;
+                if let Some((counter, mcs)) = media.peer.take() {
+                    let reply = if media.peer_request == 3 && mcs == 2
+                        && media.channel_metric.map_or(false, |m| m >= 0.85)
+                        && arq_rx.ack_map == 0 {
+                        let plan = media.receive_commit.unwrap_or(McsCommit {
+                            previous_mcs: 2, target_mcs: 3,
+                            first_sequence: arq_rx.ack_base.wrapping_add(1),
+                        });
+                        let signed = security.session.rx.sign_latest_mcs_commit(counter, 3,
+                            plan.first_sequence.wrapping_sub(1));
+                        if signed.is_ok() { media.receive_commit = Some(plan); }
+                        signed
+                    } else {
+                        security.session.rx.sign_latest_ack(counter, mcs, arq_rx.ack_base, arq_rx.ack_map)
+                    };
+                    if let Ok(wire) = reply {
+                        media.tx.start(wire).expect("signed yielding ACK");
+                        self.ccf_sent.fetch_add(1, Ordering::Relaxed);
+                        self.ack_pending.store(false, Ordering::Relaxed);
+                        media.tx.render(out_samples);
+                        return out_samples.len() as u32;
+                    }
+                }
+            }
+            if security.session.tx.expire_control(now).unwrap_or(false) {
+                self.awaiting_peer_turn.store(false, Ordering::Release);
+            }
+            if let LiveUpshift::Awaiting { attempts, deadline } = media.upshift {
+                if now >= deadline && attempts >= MCS_UPSHIFT_ATTEMPTS {
+                    media.upshift = LiveUpshift::Cooldown { started: now };
+                    self.rate_status.store(RateChangeStatus::Cooldown as u8, Ordering::Release);
+                }
+            }
+            if let LiveUpshift::Cooldown { started } = media.upshift {
+                if now.saturating_sub(started) >= MCS_COOLDOWN_MS {
+                    media.upshift = LiveUpshift::Idle;
+                    self.rate_status.store(RateChangeStatus::Idle as u8, Ordering::Release);
+                }
+            }
+            if security.session.tx.control_outstanding() {
+                out_samples.fill(0);
+                return out_samples.len() as u32;
+            }
         }
 
         // The prototype has no negotiated RTO profile yet. Bound the wait using
@@ -1095,27 +1321,41 @@ impl vradm_engine {
             self.tx_packet_queue.pop_shared();
         }
 
-        // Preserve host backpressure until a complete packet fits in the ARQ queue.
-        if let Some(slot) = self.tx_packet_queue.peek_shared() {
-            let fragments = (slot.len as usize + 36) / 37;
-            let queue = if slot.best_effort {
-                &arq_tx.pending_be
-            } else {
-                &arq_tx.pending_reliable
-            };
-            if queue.len() + fragments <= queue.capacity() {
-                if let Some(slot) = self.tx_packet_queue.pop_shared() {
-                    arq_tx
-                        .enqueue_packet(
-                            &slot.data[..slot.len as usize],
-                            slot.urgent_flush,
-                            slot.best_effort,
-                        )
-                        .expect("capacity checked before consuming packet");
+        // A negotiation drains only already-admitted ARQ work. New packets stay
+        // in the host queue, retaining backpressure and their sequence numbers.
+        let draining = (*self.ccf_media.get()).as_ref().map_or(false, |m|
+            matches!(m.upshift, LiveUpshift::Draining | LiveUpshift::Awaiting { .. }));
+        if !draining {
+            if let Some(slot) = self.tx_packet_queue.peek_shared() {
+                let fragments = (slot.len as usize + 36) / 37;
+                let queue = if slot.best_effort {
+                    &arq_tx.pending_be
+                } else {
+                    &arq_tx.pending_reliable
+                };
+                if queue.len() + fragments <= queue.capacity() {
+                    if let Some(slot) = self.tx_packet_queue.pop_shared() {
+                        arq_tx
+                            .enqueue_packet(
+                                &slot.data[..slot.len as usize],
+                                slot.urgent_flush,
+                                slot.best_effort,
+                            )
+                            .expect("capacity checked before consuming packet");
+                    }
                 }
             }
         }
 
+        let negotiation_attempt = (*self.ccf_media.get()).as_ref().and_then(|media| {
+            if !arq_tx.in_flight.is_empty() || !arq_tx.pending_reliable.is_empty()
+                || !arq_tx.pending_be.is_empty() { return None; }
+            match media.upshift {
+                LiveUpshift::Draining => Some(1),
+                LiveUpshift::Awaiting { attempts, .. } => Some(attempts + 1),
+                _ => None,
+            }
+        });
         let confirmation_due = (*self.audio_security.get())
             .as_ref()
             .map_or(false, |security| {
@@ -1125,12 +1365,21 @@ impl vradm_engine {
                         .saturating_sub(out_samples.len() as u64)
                         >= security.next_confirmation_sample
             });
+        let announce_rate = (*self.ccf_media.get()).as_ref().map_or(false, |m| m.announce_rate);
         let mut frames = [CanonicalDataFrame::new(); 8];
-        let mut n_frames = arq_tx.get_frames_to_transmit_into(8, &mut frames);
-        if n_frames == 0 && (self.ack_pending.load(Ordering::Relaxed) || confirmation_due) {
+        // Best-effort sequence numbers are a separate space. While a commit
+        // waits for REL_SEQ, send BE-only bursts at the old rate.
+        let accepted = (*self.ccf_media.get()).as_ref().and_then(|m| match m.upshift {
+            LiveUpshift::Accepted(plan) => Some(plan), _ => None,
+        });
+        let limit = if accepted.is_some() && !arq_tx.pending_be.is_empty() {
+            arq_tx.pending_be.len().min(8)
+        } else { 8 };
+        let mut n_frames = arq_tx.get_frames_to_transmit_into(limit, &mut frames);
+        if n_frames == 0 && (announce_rate || negotiation_attempt.is_some() || (self.ack_pending.load(Ordering::Relaxed) && (*self.ccf_media.get()).is_none()) || confirmation_due) {
             // §2.1 permits zero-payload canonical feedback. Mark it best-effort
             // so feedback never consumes REL_SEQ or demands an ACK of its own.
-            // Authenticated compact-control turns remain a separate milestone.
+            // Empty old-rate frames carry requests without consuming REL_SEQ.
             frames[0].ctrl = 0x06;
             n_frames = 1;
         }
@@ -1139,6 +1388,15 @@ impl vradm_engine {
             return out_samples.len() as u32;
         }
 
+        if let Some(plan) = accepted {
+            if frames[0].payload_len > 0 && frames[0].ctrl & 0x04 == 0
+                && frames[0].seq == plan.first_sequence {
+                self.active_tx_mcs.store(plan.target_mcs, Ordering::Release);
+                self.telem_seqlock.update(|t| t.active_tx_mcs = plan.target_mcs);
+                (*self.ccf_media.get()).as_mut().unwrap().upshift = LiveUpshift::Idle;
+                self.rate_status.store(RateChangeStatus::Idle as u8, Ordering::Release);
+            }
+        }
         let cur_mcs = self.active_tx_mcs.load(Ordering::Relaxed);
         let mut needs_ack = false;
         for (i, frame) in frames.iter_mut().enumerate().take(n_frames) {
@@ -1154,7 +1412,25 @@ impl vradm_engine {
             let security = (*self.audio_security.get())
                 .as_mut()
                 .expect("authenticated gate");
-            let beacon = match security.session.tx.beacon(cur_mcs, cur_mcs, 0) {
+            let beacon_result = if negotiation_attempt.is_some() || (needs_ack && (*self.ccf_media.get()).is_some()) {
+                let now = security.session.clock_ms.saturating_add(
+                    security.render_samples.max(security.capture_samples) / 8);
+                let media = (*self.ccf_media.get()).as_mut().unwrap();
+                media.rx.reset();
+                let deadline = now.saturating_add(12_000);
+                if let Some(attempts) = negotiation_attempt {
+                    media.upshift = LiveUpshift::Awaiting { attempts, deadline };
+                    self.rate_status.store(RateChangeStatus::AwaitingReply as u8, Ordering::Release);
+                }
+                security.session.tx.begin_control(ControlRequest {
+                    current_mcs: cur_mcs,
+                    target_mcs: if negotiation_attempt.is_some() { 3 } else { cur_mcs }, tx_power: 0,
+                    command: if negotiation_attempt.is_some() { ControlCommand::McsCommitAck }
+                        else { ControlCommand::StandaloneAck }, yield_turn: true,
+                    deadline_ms: deadline,
+                }, now)
+            } else { security.session.tx.beacon(cur_mcs, cur_mcs, 0) };
+            let beacon = match beacon_result {
                 Ok(beacon) => beacon,
                 Err(_) => {
                     *self.audio_security.get() = None;
@@ -1181,6 +1457,7 @@ impl vradm_engine {
             phy_tx.modulate_burst(cur_mcs, &frames[..n_frames], beac_seq)
         };
         tx_ring.write_samples(pcm_burst);
+        if let Some(media) = (*self.ccf_media.get()).as_mut() { media.announce_rate = false; }
         self.ack_pending.store(false, Ordering::Relaxed);
         self.awaiting_peer_turn.store(needs_ack, Ordering::Release);
         let frame_samples = if cur_mcs == 2 { 5200 } else { 1320 };
@@ -1219,7 +1496,7 @@ impl vradm_engine {
     /// Caller must be the sole audio owner. Serialize both audio callbacks;
     /// no direct reset, destruction, or internal-state access may overlap.
     pub unsafe fn process_audio(&self, in_samples: &[i16]) {
-        if unsafe { (*self.tx_audio_ring.get()).available_read() } == 0 {
+        if !self.audio_burst_pending() {
             self.process_cmds_on_audio_thread();
         }
         let phy_rx = unsafe { &mut *self.phy_rx.get() };
@@ -1244,12 +1521,73 @@ impl vradm_engine {
             let now_ms = security
                 .session
                 .clock_ms
-                .saturating_add(security.capture_samples / 8);
+                .saturating_add(security.capture_samples.max(security.render_samples) / 8);
             let direction = security.session.role == SessionRole::Responder;
             let before = security.session.rx.mac_failures();
+            if let Some(media) = (*self.ccf_media.get()).as_mut() {
+                let control_now = security.session.clock_ms.saturating_add(
+                    security.render_samples.max(security.capture_samples) / 8);
+                if security.session.tx.expire_control(control_now).unwrap_or(false) {
+                    self.awaiting_peer_turn.store(false, Ordering::Release);
+                }
+                if security.session.tx.control_outstanding() {
+                    let mut offset = 0;
+                    while offset < in_samples.len() {
+                        let progress = media.rx.push(&in_samples[offset..]);
+                        offset += progress.consumed;
+                        if let Some(frame) = progress.frame {
+                            if let Ok(response) = security.session.rx.verify_control_response(
+                                &mut security.session.tx, frame.codeword(), frame.erasures(), control_now) {
+                                if let Some(boundary) = response.commit_sequence {
+                                    if boundary == arq_tx.next_seq && response.frame.ack_map == 0
+                                        && arq_tx.in_flight.is_empty() && arq_tx.pending_reliable.is_empty() {
+                                        media.upshift = LiveUpshift::Accepted(McsCommit {
+                                            previous_mcs: 2, target_mcs: 3, first_sequence: boundary,
+                                        });
+                                        self.rate_status.store(RateChangeStatus::AwaitingBoundary as u8, Ordering::Release);
+                                    } else {
+                                        media.upshift = LiveUpshift::Cooldown { started: control_now };
+                                        self.rate_status.store(RateChangeStatus::Cooldown as u8, Ordering::Release);
+                                    }
+                                } else {
+                                    arq_tx.on_ack_received(response.frame.ack_base, response.frame.ack_map);
+                                }
+                                security.session.tx.reject_control(control_now).expect("monotonic control clock");
+                                security.session.idle_confirmation_retries = 0;
+                                self.awaiting_peer_turn.store(false, Ordering::Release);
+                                self.ccf_received.fetch_add(1, Ordering::Relaxed);
+                                media.rx.reset();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             let count = phy_rx.process_with_verifier(&mut frames, direction, &mut |beacon| {
-                let verified = matches!(beacon.current_mcs, 2 | 3)
-                    && security.session.rx.verify_beacon(beacon, now_ms).is_ok();
+                let counter = if matches!(beacon.current_mcs, 2 | 3) {
+                    security.session.rx.verify_beacon(beacon, now_ms).ok()
+                } else { None };
+                let verified = counter.is_some();
+                if let (Some(media), Some(counter)) = ((*self.ccf_media.get()).as_mut(), counter) {
+                    // Replay-window admission alone must not let an older
+                    // burst replace a newer receive plan or undo its rate.
+                    if !security.session.rx.is_latest_beacon(counter) { return false; }
+                    // A target-rate header permits tentative demodulation only
+                    // for a retained plan. Canonical REL_SEQ admission below
+                    // completes the receive-side transition.
+                    let current = self.active_rx_mcs.load(Ordering::Relaxed);
+                    if beacon.current_mcs > current && !media.receive_commit.map_or(false,
+                        |p| p.target_mcs == beacon.current_mcs) { return false; }
+                    if beacon.current_mcs < current {
+                        self.active_rx_mcs.store(beacon.current_mcs, Ordering::Release);
+                        self.telem_seqlock.update(|t| t.active_rx_mcs = beacon.current_mcs);
+                        media.receive_commit = None;
+                    }
+                    media.peer = Some((counter, beacon.current_mcs));
+                    media.peer_request = beacon.requested_mcs;
+                    media.burst_needs_ack = false;
+                    media.reply_ready = false;
+                }
                 if verified {
                     security.session.idle_confirmation_retries = 0;
                 }
@@ -1280,6 +1618,27 @@ impl vradm_engine {
                     continue;
                 }
 
+                if let Some(media) = (*self.ccf_media.get()).as_mut() {
+                    let Some((_, burst_mcs)) = media.peer else { continue; };
+                    if (frame.ctrl >> 4) & 7 != burst_mcs { continue; }
+                    if let Some(plan) = media.receive_commit {
+                        let reliable = frame.payload_len > 0 && frame.ctrl & 4 == 0;
+                        if burst_mcs == plan.target_mcs {
+                            // Window-relative comparison remains valid across 255→0.
+                            if !reliable || frame.seq.wrapping_sub(plan.first_sequence) >= 8 { continue; }
+                            self.active_rx_mcs.store(plan.target_mcs, Ordering::Release);
+                            self.telem_seqlock.update(|t| t.active_rx_mcs = plan.target_mcs);
+                            media.receive_commit = None;
+                        } else if reliable {
+                            // Old-rate data at/after the boundary abandons a lost
+                            // commit; fresh requests can reserve a new boundary.
+                            if frame.seq.wrapping_sub(plan.first_sequence) < 128 {
+                                media.receive_commit = None;
+                            }
+                        }
+                    }
+                }
+
                 // Ingest piggybacked ACK into transmitter
                 arq_tx.on_ack_received(frame.ack_base, frame.ack_map);
 
@@ -1292,6 +1651,15 @@ impl vradm_engine {
                 // Empty feedback and best-effort datagrams never solicit an ACK.
                 if frame.payload_len > 0 && frame.ctrl & 0x04 == 0 {
                     self.ack_pending.store(true, Ordering::Relaxed);
+                }
+
+                if let Some(media) = (*self.ccf_media.get()).as_mut() {
+                    media.burst_needs_ack |= frame.payload_len > 0 && frame.ctrl & 0x04 == 0;
+                    if frame.ctrl & 0x08 != 0 && (media.burst_needs_ack || media.peer_request == 3
+                        && media.peer.map_or(false, |(_, mcs)| mcs == 2)) {
+                        media.reply_ready = true;
+                        media.burst_needs_ack = false;
+                    }
                 }
 
                 // The audio owner is the only queue producer; the host can

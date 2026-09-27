@@ -261,27 +261,63 @@ pub fn condition_and_quantize_pcm_into(samples: &[f32], target_rms: f32, out_pcm
         return 0;
     }
 
-    let mut sum_sq = 0.0f32;
-    let mut max_abs = 0.0f32;
-    for &s in &samples[..n] {
-        sum_sq += s * s;
-        let a = s.abs();
-        if a > max_abs {
-            max_abs = a;
-        }
+    // A bad DSP sample must not poison the gain or reach the device. Reject
+    // the whole addressed block, preserving the caller-owned output suffix.
+    if !target_rms.is_finite() || target_rms < 0.0
+        || samples[..n].iter().any(|s| !s.is_finite()) {
+        out_pcm[..n].fill(0);
+        return n;
     }
 
-    let current_rms = (sum_sq / n as f32).sqrt().max(1e-6);
-    let g_rms = target_rms / current_rms;
-    let g_peak = V_TARGET_PEAK / max_abs.max(1e-6);
-    let g = g_rms.min(g_peak);
+    // f64 metering avoids f32 energy overflow and prevents gain-rounding noise
+    // at the 0.45 FS boundary from spuriously activating the nonlinear branch.
+    // All finite f32 input magnitudes can be squared safely in this accumulator.
+    let mut sum_sq = 0.0f64;
+    let mut max_abs = 0.0f64;
+    for &sample in &samples[..n] {
+        let sample = sample as f64;
+        sum_sq += sample * sample;
+        max_abs = max_abs.max(sample.abs());
+    }
+    let current_rms = (sum_sq / n as f64).sqrt().max(1e-6);
+    let g_rms = target_rms as f64 / current_rms;
+    let g_peak = V_TARGET_PEAK as f64 / max_abs.max(1e-6);
+    let gain = g_rms.min(g_peak);
 
     for i in 0..n {
-        let scaled = samples[i] * g;
-        let limited = V_PEAK_MAX * (scaled / V_PEAK_MAX).tanh();
+        let scaled = (samples[i] as f64 * gain) as f32;
+        let limited = limit_exceptional_peak(scaled);
         out_pcm[i] = (limited * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
     }
     n
+}
+
+// SPEC §3 scopes tanh to exceptional excursions, not every nominal sample.
+// With finite peak-normalized blocks this branch should never be needed;
+// retaining it protects future post-normalization transient-producing stages.
+fn limit_exceptional_peak(sample: f32) -> f32 {
+    if sample.abs() > V_TARGET_PEAK {
+        V_PEAK_MAX * (sample / V_PEAK_MAX).tanh()
+    } else {
+        sample
+    }
+}
+
+#[cfg(test)]
+mod limiter_backstop_tests {
+    use super::*;
+    #[test]
+    fn limiter_is_identity_through_threshold_and_bounds_exceptional_peaks() {
+        for sample in [-V_TARGET_PEAK, -0.1, -0.0, 0.0, 0.1, V_TARGET_PEAK] {
+            assert_eq!(limit_exceptional_peak(sample).to_bits(), sample.to_bits());
+        }
+        for sample in [0.451, 0.5, 1.0, 10.0, f32::MAX] {
+            let output = limit_exceptional_peak(sample);
+            assert_eq!(output, 0.5 * (sample / 0.5).tanh());
+            assert!(output > 0.0 && output <= V_PEAK_MAX);
+            assert_eq!(limit_exceptional_peak(-sample), -output);
+        }
+    }
 }
 
 pub fn condition_and_quantize_pcm(samples: &[f32], target_rms: f32) -> Vec<i16> {
@@ -969,6 +1005,10 @@ impl PhyReceiver {
         loop {
             match self.state {
                 PhyRxState::IdleSearch => {
+                    // Keep each returned batch associated with one verified
+                    // beacon. The engine must consume its frames before a later
+                    // beacon can replace the retained control/boundary context.
+                    if decoded_frames != 0 { break; }
                     if self.sample_count < BARKER_TOTAL_SAMPLES {
                         break;
                     }
@@ -1137,6 +1177,7 @@ impl PhyReceiver {
                 }
 
                 PhyRxState::PayloadDemod { mcs, beac_seq, frame_idx } => {
+                    if decoded_frames == out_frames.len() { break; }
                     let frame_samples = if mcs == 2 { 65 * 80 } else { 33 * 40 };
                     if self.sample_count < frame_samples {
                         break;

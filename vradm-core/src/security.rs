@@ -584,6 +584,35 @@ impl ControlRx {
         Ok(candidate)
     }
 
+    pub(crate) fn is_latest_beacon(&self, counter: u16) -> bool {
+        self.valid && self.bitmap != 0 && counter == self.highest
+    }
+
+    /// Engine-only ACK signing for its latest admitted peer beacon. The engine
+    /// retains this counter until that burst's payload has been processed.
+    pub(crate) fn sign_latest_ack(&self, counter: u16, mcs: u8, base: u8, map: u8)
+        -> Result<[u8;16], SecurityError> {
+        if !self.valid { return Err(SecurityError::ResyncRequired); }
+        if self.bitmap == 0 || counter != self.highest { return Err(SecurityError::Replay); }
+        if mcs > 4 || map > 127 { return Err(SecurityError::Malformed); }
+        self.keys.sign_ccf(counter, CompactControlFrame {
+            ccf_ctrl: 0x89 | (mcs << 4), ack_base: base, ack_map: map, ccf_mac: 0,
+        })
+    }
+
+    /// Live scheduler has already authenticated this latest request and owns
+    /// its retained boundary. Do not re-admit the beacon through replay state.
+    pub(crate) fn sign_latest_mcs_commit(&self, counter: u16, mcs: u8, base: u8)
+        -> Result<[u8; 16], SecurityError> {
+        if !self.valid { return Err(SecurityError::ResyncRequired); }
+        if self.bitmap == 0 || counter != self.highest { return Err(SecurityError::Replay); }
+        if mcs > 4 { return Err(SecurityError::Malformed); }
+        self.keys.sign_ccf(counter, CompactControlFrame {
+            ccf_ctrl: 0x88 | (mcs << 4) | ControlCommand::McsCommitAck as u8,
+            ack_base: base, ack_map: 0, ccf_mac: 0,
+        })
+    }
+
     /// Authenticate a fresh peer upshift request, check trusted local metric
     /// M >= 0.85, and sign its response using the inferred full counter.
     /// Call this instead of verify_beacon for this request, using the same Rx

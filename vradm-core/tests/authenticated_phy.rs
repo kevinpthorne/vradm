@@ -76,3 +76,28 @@ fn physical_header_erasure_never_attempts_mac_verification() {
     }
     assert_eq!(attempts, 0);
 }
+
+#[test]
+fn buffered_bursts_keep_frames_with_their_verified_beacon() {
+    let keys = SessionKeys::derive(&[1;16], &[2;16], &[3;16]);
+    let mut control = ControlTx::new(keys);
+    let mut tx = PhyTransmitter::new(3);
+    let mut rx = PhyReceiver::new();
+    let mut pcm = Vec::new();
+    for seq in 0..2 {
+        let beacon = control.beacon(3, 3, 0).unwrap();
+        let mut frame = CanonicalDataFrame::new(); frame.ctrl = 0x3e; frame.seq = seq;
+        pcm.extend_from_slice(tx.modulate_authenticated(beacon, &[frame], true).unwrap());
+    }
+    rx.ingest_samples(&pcm);
+    let mut frames = [CanonicalDataFrame::new(); 8];
+    let mut verified = Vec::new();
+    for seq in 0..2 {
+        assert_eq!(rx.process_with_verifier(&mut frames, true, &mut |beacon| {
+            verified.push(beacon.sequence); true
+        }), 1);
+        assert_eq!(frames[0].seq, seq);
+        assert_eq!(verified.len(), seq as usize + 1);
+        assert_eq!(verified.last(), Some(&seq));
+    }
+}

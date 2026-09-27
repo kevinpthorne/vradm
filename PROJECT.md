@@ -1,15 +1,26 @@
 # Project: V-RADM Platform
 
-## Current handoff — 2026-09-25
+## Current handoff — 2026-09-26
 
 Read [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for the verified
 implementation inventory, this continuation's repairs, outstanding core gaps,
 and the phone/phone + PBX/PBX direction. The architecture and file tree below
 are the original **target design**, not a list of implemented components.
+See [SPEC_CONFORMANCE.md](docs/SPEC_CONFORMANCE.md) for the focused audit of
+known mismatches, explicit project profiles and incomplete requirements.
 Only `vradm-core` currently exists. M1 remains in progress; M2–M6 are unstarted.
 See [M1_PLAN.md](docs/M1_PLAN.md) for concrete completion work and the next
-integrated checkpoint. Live burst RMS configuration and boundary-applied amplitude
+integrated checkpoint. [Endpoint](docs/ENDPOINT.md) now binds bootstrap,
+authenticated packet I/O and reset/rekey behind one host/audio API.
+[Live CCF feedback](docs/LIVE_CCF.md) now connects streamed compact acknowledgments
+to that endpoint's ARQ in a full-duplex software profile.
+Live burst RMS configuration and boundary-applied amplitude
 commands now work; see [TX_AMPLITUDE.md](docs/TX_AMPLITUDE.md).
+[Live MCS2→3 negotiation](docs/LIVE_MCS.md) now drains existing ARQ work,
+recovers lost/forged commit replies and applies the reliable sequence boundary
+through the same public Endpoint. Explicit emergency downshift preserves in-flight
+data and cancels pending upshifts. General adaptation and acoustic scheduling
+remain open; host-supplied metrics are explicit and not measured automatically.
 
 The root Cargo workspace now supports `cargo test --workspace`. Sustained PCM
 transfer has standalone feedback and bounded retry recovery; telemetry copies
@@ -48,8 +59,9 @@ RS byte-erasure recovery through the authenticated control guard; see
 [CCF_PCM_PROFILE.md](docs/CCF_PCM_PROFILE.md). A bounded CCF/EOT/guard renderer now emits sample-exact
 control turns with busy rejection and explicit cancellation. An aligned turn
 receiver now checks both EOT tones and waits through the guard before returning
-an unverified CCF for MAC admission. Unknown-boundary receive acquisition,
-live media scheduling, platform audio/drain adapters and the C ABI path remain unfinished; the legacy C constructor still sends unauthenticated PCM.
+an unverified CCF for MAC admission. The endpoint now acquires compact ACKs
+from streaming PCM and dispatches verified responses to live ARQ. Acoustic TDD
+scheduling, platform audio/drain adapters and the C ABI path remain unfinished; the legacy C constructor still sends unauthenticated PCM.
 These are software prototype improvements, not field or codec qualification.
 The tests are now visible to Git.
 

@@ -4,7 +4,9 @@
 CCF transaction guard. It borrows one endpoint's ControlTx and ControlRx exclusively
 and performs no allocations, locks, or PCM work. Keep the policy object for the
 session: recreating it loses its local cooldown/commit plan. Dropping it does not
-clear an outstanding request in ControlTx. It is not wired into the live engine.
+clear an outstanding request in ControlTx. The live engine uses the same security transaction owners and retry constants,
+with its own audio-owned drain/boundary state rather than this borrowing helper;
+see [LIVE_MCS.md](LIVE_MCS.md).
 
 ## Upshift attempts and cooldown
 
@@ -66,10 +68,10 @@ ordinary data and cancellation.
 The policy accepts logical MCS numbers 0–4; that does not implement their PHYs.
 Aligned CCF modulation/decoding is available in [CCF_PCM_PROFILE.md](CCF_PCM_PROFILE.md).
 Receiver-side metric admission and signed response construction are described below.
-Still missing: CCF acquisition/live transport, commit response scheduling, sequence-aware application to live payload modulation,
-PLCP-triggered receiver switchover, dynamic RTO, TDD scheduling, host events and
-C ABI integration. The existing engine's direct MCS command remains a prototype
-control and does not call this negotiator. M1 remains incomplete.
+The Endpoint now supplies live CCF transport, commit scheduling and sequence-boundary
+application for a drained MCS2→3 window. General mode transitions, dynamic RTO,
+TDD scheduling, host events and C ABI integration remain. Legacy direct MCS
+commands still bypass negotiation and are rejected by Endpoint. M1 remains incomplete.
 
 ## Receiver-side commit response admission
 

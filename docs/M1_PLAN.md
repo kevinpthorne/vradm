@@ -15,6 +15,16 @@ The endpoint must not require test code to manually sign replies, move counters
 between disconnected policies, or assert that a sequence boundary was applied.
 Then expose that lifecycle to C with explicit host/audio ownership.
 
+The first lifecycle slice now exists as [Endpoint](ENDPOINT.md): public-API
+bootstrap, drain-gated installation, packet exchange and explicit reset/rekey.
+[Live compact feedback](LIVE_CCF.md) opens/verifies
+CCF transactions and updates ARQ through streamed PCM in the full-duplex profile. The
+drained-window [MCS2→3 negotiation](LIVE_MCS.md) now carries requests/replies,
+recovers lost commits and applies the reliable sequence boundary through the same
+endpoint. An explicit trusted-metric emergency return to MCS2 also preserves
+in-flight data and cancels pending upshifts. General transitions, acoustic turn
+scheduling and C exposure remain.
+
 Required integration:
 
 1. Make the session/control owners and pending MCS state part of a single live
@@ -46,8 +56,9 @@ Required integration:
 
 The latest amplitude change closes one concrete configuration gap: the configured
 RMS ceiling now affects engine bursts, and SET_TX_PARAMS updates that ceiling at
-burst boundaries. It does not complete the timing/DSP work package. Existing
-normalization/limiter behavior still needs its separate spec qualification.
+burst boundaries. It does not complete the timing/DSP work package. The unconditional nominal
+limiter compression has also been corrected with conditioner-only signal tests.
+Full modem normalization/limiter qualification remains outstanding.
 
 ## Outside M1
 

@@ -81,7 +81,9 @@ transfers, and allocation-free installation/PCM callbacks.
 
 [Control transaction guards](CONTROL_TRANSACTIONS.md) now bind CCF responses to
 local requests and separate duplicate ACK updates from one-time control effects;
-they are not yet connected to engine PCM scheduling.
+they are now connected for standalone ACKs in the separate Endpoint/
+new_ccf_endpoint full-duplex profile; see [LIVE_CCF.md](LIVE_CCF.md). The original
+new_authenticated constructor retains its canonical-feedback behavior.
 
 [HandshakeBridge](HANDSHAKE_BRIDGE.md) now supplies bounded PCM queues, worker
 pumping and device-drain-gated engine routing. Still missing: platform audio/drain

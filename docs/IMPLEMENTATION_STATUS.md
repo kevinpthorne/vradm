@@ -7,19 +7,39 @@ not establish vocoder, cellular-call, or hardware performance.
 
 ## Active handoff — 2026-09-26
 
-Current checkpoint: live transmit RMS configuration and burst-boundary amplitude
-commands are implemented and verified. Full suite passed: 288 tests (281 runtime
-and seven compile-fail doctests), including seven new amplitude/allocation tests.
-All-target compilation passed without warnings; `git diff --check` passed.
-No work or verification is running. Final log: `/tmp/vradm-amplitude-final.log`
-(temporary). [TX_AMPLITUDE.md](TX_AMPLITUDE.md) records configuration semantics.
+Current checkpoint: live negotiated MCS2→3 and explicit emergency return to MCS2
+are implemented in the Rust Endpoint. Emergency downshift requires trusted local
+M < 0.60, preserves unacknowledged data and cooldown, and cancels pending upshifts.
+It applies after buffered audio finishes and announces the lower rate when idle.
+The sender drains already-admitted ARQ work, retains host-queued packets, sends
+old-rate requests and applies the verified commit only at the next REL_SEQ
+boundary. The receiver retains its plan across retries and requires a verified
+target PLCP plus a matching forward sequence before admitting target-rate data.
 
-Read [M1_PLAN.md](M1_PLAN.md) before continuing. The next priority is an integrated
-authenticated 8 kHz MCS2/3 endpoint lifecycle, not more isolated control helpers.
-Live CCF scheduling/acquisition, rate switching, authenticated C integration,
-missing PHY modes, timing/reliability work, SOTP and qualification still block
-full M1. Platform products are later milestones. The legacy C constructor is
-still unauthenticated.
+Public host APIs: request_upshift(3), emergency_downshift(M), set_channel_metric(M),
+rate_change_status().
+Metrics are explicit trusted host input, absent by default and cleared on reset;
+no automatic estimator is claimed. Full-duplex directions can use different rates.
+Best-effort data stays old-rate until reliable traffic reaches the commit boundary.
+Three fresh-counter attempts precede a ten-second cooldown. Lost/forged replies,
+unsupported target rates, queue pressure and reset do not bypass the guard.
+
+Verification passed: 318 tests (311 runtime and seven compile-fail doctests),
+including all 19 Endpoint tests and the buffered-burst PHY regression. Callback
+allocation/deallocation checks pass through handoff, negotiation, data and emergency
+downshift. All-target compilation is warning-free; git diff --check passes.
+No work or verification is running. Final logs: `/tmp/vradm-downshift-final.log`
+and `/tmp/vradm-downshift-check.log` (temporary). Previous checkpoint: 315 tests.
+See [LIVE_MCS.md](LIVE_MCS.md) for the conservative drained-window restrictions,
+API semantics and proof scope. SPEC.md is unchanged.
+
+Remaining integrated work: general mode transitions and automatic metrics,
+acoustic TDD ownership, authenticated C lifecycle, mutual readiness and automatic
+outage/rekey coordination. Missing PHY modes, timing recovery, SOTP and qualification
+still block M1. Next focused integration slice: expose this tested full-duplex
+lifecycle through C with explicit host/audio ownership. Acoustic TDD remains a
+separate scheduling requirement. See [M1_PLAN.md](M1_PLAN.md). Legacy C construction
+is unauthenticated.
 
 Changes: established session counters move exactly once via `SessionTransfer`
 into the host command queue. The authenticated boxed Rust engine gates PCM until
@@ -36,16 +56,85 @@ physical erasure separation, queue-full retry, key replacement at burst boundari
 reset/rekey lockout, unsupported profiles, non-cloneable transfers, and zero
 callback allocations/frees. Final log: `/tmp/vradm-auth-final.log` (temporary).
 
-Next core work: CCF acquisition/media scheduling and live transaction dispatch;
-mutual readiness acknowledgment;
-negotiated MCS changes; trusted outage/rekey timers; host events and C ABI
-selection. Platform audio adapters and actual device-drain callbacks still need
+Next core work: general MCS transitions and acoustic control-turn scheduling;
+mutual readiness acknowledgment; trusted outage/rekey timers; host events and
+C ABI selection. Platform audio adapters and actual device-drain callbacks still need
 implementation/qualification. Cache persistence
 remains open. Canonical payloads/ACK fields are not MAC-protected by PLCP; application authentication remains at SSH/Mosh.
 No codec/hardware/drift qualification or complete M1 acceptance is claimed.
 
 Preserve existing uncommitted work; no commits have been made. This document is
-the model handoff. Previous verified checkpoint: 281 tests.
+the model handoff. Earlier checkpoint before limiter correction: 302 tests.
+
+## Live emergency downshift
+
+`EndpointHost::emergency_downshift(M)` queues a return to MCS2 for explicit trusted
+0 <= M < 0.60. It applies at a burst boundary, cancels this direction's outstanding
+control/upshift, preserves ARQ data and cooldown, and announces the lower rate even
+when idle. Buffered/device-queued audio cannot be retracted. A pending emergency
+blocks a new upshift; queue-full failure leaves admission intact. The independent
+receive metric and reverse-direction plan are unchanged. See LIVE_MCS.md.
+
+Three new endpoint tests cover idle announcement, validation/queue pressure,
+finishing buffered audio, lower-rate retry of lost data/ACK, cancellation of pending
+and accepted upshifts, command ordering and later renegotiation. Existing tests
+now verify cooldown preservation and zero callback allocations through downshift.
+Automatic metric estimation/adaptation and other MCS modes remain unimplemented.
+
+## Live negotiated MCS2→3
+
+The endpoint now owns sender drain/retry/commit state and receiver plans alongside
+its existing ControlTx/ControlRx. No external complete_commit assertion or signed
+reply injection is needed for successful operation. Six new endpoint tests cover
+success, loss/forgery, metric refusal, abort/cooldown, BE before REL, active-window
+drain across 255→0, reset of an accepted plan/metric, queue pressure, and rejection
+of authenticated target-rate traffic without a plan. A PHY regression test proves
+buffered bursts preserve their own verified-beacon context. Allocation coverage
+now includes negotiation. See LIVE_MCS.md and SPEC_CONFORMANCE.md.
+
+## Nominal limiter correction
+
+The data-burst conditioner now applies tanh only above 0.45 FS; nominal samples
+remain linear through quantization. f64 energy/gain avoids overflow from finite
+f32 inputs and accidental threshold crossings due to gain rounding. Non-finite
+input/invalid target silences only the addressed output. Direct backstop tests
+cover exceptional peaks; carrier-projection tests require conditioner-only error
+below 0.1%, with per-sample error at PCM quantization scale. See TX_AMPLITUDE.md.
+
+The literal exceptional formula still has a discontinuous join to the linear
+region; this is documented for spec clarification and is not reached by nominal
+peak normalization. Full TC-10c and codec/CPU qualification remain incomplete.
+
+## Live CCF feedback integration
+
+Endpoint now opens counter-bound standalone ACK transactions for reliable bursts,
+signs replies from verified peer burst context, renders CCF audio and acquires
+incoming replies with a ten-phase streaming search. Verified replies update live
+ARQ and close the transaction. Loss/forgery causes a fresh-counter retry with no
+duplicate delivery. Canonical ACK-only bursts are disabled for this opt-in profile;
+legacy constructors retain their behavior. Raw rate commands are rejected here; the typed live negotiation path is separate.
+
+[LIVE_CCF.md](LIVE_CCF.md) records the explicit full-duplex assumptions, fixed
+12-second sample-clock timeout, detectable-sync requirement and unqualified CPU/
+codec behavior. This is not acoustic TDD ownership or exact EOT timing. The live
+MCS2→3 path above now applies negotiated boundaries within this same engine.
+
+## Integrated endpoint lifecycle
+
+`Endpoint` now binds coordinator, bridge and authenticated engine behind unique
+host/audio handles. Host pumping performs automatic drain-gated session transfer;
+packet admission waits for audio-side installation. Reset closes admission and
+resets both layers while preserving nonce history. Buffered old PCM is drained
+before handshake routing, avoiding a stranded-ring reset deadlock. Callers cannot
+mix another engine into the bridge or bypass coordinated reset via raw commands.
+
+[ENDPOINT.md](ENDPOINT.md) describes the 8 kHz MCS2/3 profile, one-time
+split, device-drain contract, graceful reset and limits. Public-API tests cover
+bootstrap, bidirectional packets, loss recovery and rekey. This advances the first
+M1 integrated checkpoint; standalone CCF feedback is now wired into this endpoint,
+and the drained-window MCS2→3 path is integrated. General transitions and acoustic
+TDD remain open. No acoustic/device qualification or
+complete M1 is claimed.
 
 ## Live transmit amplitude integration
 
@@ -541,11 +630,11 @@ unauthenticated for the original prototype harnesses.
 
 | Area | Current limitation / next work |
 | --- | --- |
-| Session security | Opt-in Rust engine now verifies PLCP MAC/replay before payload/ARQ, using single-use established-session handoff. Legacy C constructor remains unauthenticated. Host-worker bootstrap/provisional confirmation is implemented; platform PCM/drain adapters, mutual readiness acknowledgment, CCF media scheduling/dispatch, outage/rekey coordination, C ABI exposure and field qualification remain. |
-| Compact control and TDD | Compact frame serialization, authenticated request/response guards and separate aligned CCF/EOT/guard transmit/receive components exist. Live authenticated control-turn scheduling, negotiated ownership, unknown-boundary acquisition and collision recovery are absent. Current canonical feedback is suitable for the software/digital link harness, not proof of acoustic TDD compliance. |
+| Session security | Opt-in Rust engine now verifies PLCP MAC/replay before payload/ARQ, using single-use established-session handoff. Legacy C constructor remains unauthenticated. Host-worker bootstrap/provisional confirmation is implemented; platform PCM/drain adapters, mutual readiness acknowledgment, acoustic control scheduling, outage/rekey coordination, C ABI exposure and field qualification remain. |
+| Compact control and TDD | Compact frame serialization, authenticated request/response guards and separate aligned CCF/EOT/guard transmit/receive components exist. Standalone authenticated compact ACKs now run in the Endpoint full-duplex profile with phase-bank acquisition. Acoustic TDD scheduling/ownership, qualified acquisition and collision recovery remain absent. Current canonical feedback is suitable for the software/digital link harness, not proof of acoustic TDD compliance. |
 | Modulation | MCS 0/1 fall through to the DQPSK path. MCS 4 currently uses 40-sample DQPSK slots (1,320 samples/frame), not the required 28+4 CP-OFDM slots (1,056 samples/frame). Implement these modes and qualify them independently. |
 | Timing and codecs | Continuous DLL/Farrow recovery, CP tracking, codec-in-the-loop and TC-01–TC-11 qualification remain outstanding. No vocoder-resilience claim follows from these tests. |
-| Configuration | 16 kHz and auto-rate adaptation are not fully wired through DSP. The transmit RMS ceiling and boundary-applied amplitude command are now wired into data-engine burst conditioning; separate control/bootstrap profiles retain their own amplitude rules. The standalone negotiator now supplies retry/cooldown and verified commit plans, but engine MCS commands still switch locally rather than applying that handshake at a payload sequence boundary. |
+| Configuration | 16 kHz and auto-rate adaptation are not fully wired through DSP. The unconditional-tanh defect is corrected; nominal conditioning is linear and the exceptional-only backstop is tested. Full signal/limiter qualification remains open. The transmit RMS ceiling and boundary-applied amplitude command are now wired into data-engine burst conditioning; separate control/bootstrap profiles retain their own amplitude rules. Endpoint now integrates drained-window MCS2→3 negotiation and sequence-boundary application using trusted host metric input. General adaptation remains open; legacy engine MCS commands still switch locally. |
 | ARQ and packet delivery | Adaptive RTO and temporal context expiry still need work. Ordered reliable delivery is implemented. Structural fragment validation and host receive-queue backpressure are implemented (see below). Initial sequence is now explicit (default 0); authenticated negotiation is not implemented. Overlapping live packet ranges and extensions of delivered packets are rejected; conflicting duplicate content and broader ACK validation still need review. |
 | Ownership/lifecycle | Safe Rust has exclusive queue endpoints and host/audio engine handles. Raw shared engine operations are unsafe and require caller-enforced roles. C callers must honor §10's ownership/quiescence contract. Queued reset preserves consumer ownership and host-side object cleanup. Miri/TSan validation remains outstanding. |
 | SOTP | Staging/hash helpers and test-injected receive objects exist; there is no end-to-end RFC 6330 encoder/decoder transfer. |
